@@ -1756,6 +1756,7 @@ def update_columns_from(
     op = LanceOperation.Update(
         updated_fragments=updated_fragments,
         fields_modified=list(all_fields_modified),
+        update_mode="rewrite_columns",
     )
     LanceDataset.commit(
         uri,
