@@ -955,6 +955,35 @@ def test_update_columns_from_does_not_retry_commit_conflict(
     assert commit_calls == 1
 
 
+def test_update_columns_from_commits_rewrite_columns_operation(
+    multi_fragment_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    committed_update_modes: list[str] = []
+    original_commit = cast(Callable[..., LanceDataset], LanceDataset.commit)
+
+    def capturing_commit(
+        base_uri: str | Path | LanceDataset,
+        operation: object,
+        *args: object,
+        **kwargs: object,
+    ) -> LanceDataset:
+        assert isinstance(operation, lance.LanceOperation.Update)
+        committed_update_modes.append(operation.update_mode)
+        return original_commit(base_uri, operation, *args, **kwargs)
+
+    source = lr.read_lance(str(multi_fragment_path), with_metadata=True)
+    monkeypatch.setattr(LanceDataset, "commit", capturing_commit)
+
+    lr.update_columns_from(
+        str(multi_fragment_path),
+        source,
+        columns=["value"],
+    )
+
+    assert committed_update_modes == ["rewrite_columns"]
+
+
 def test_update_columns_from_requires_dataset(multi_fragment_path: Path) -> None:
     with pytest.raises(ValueError, match="'ds' must be provided"):
         lr.update_columns_from(
