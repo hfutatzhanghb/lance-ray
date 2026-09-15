@@ -462,6 +462,65 @@ class TestMergeIntoMergeOnRead:
         assert all(values[i] == f"orig_{i}" for i in range(5, 10))
 
 
+class TestMergeIntoCommitRetry:
+    def test_rebase_detects_in_place_deletion_metadata_change(self, temp_dir):
+        """Same fragment id with a new deletion file is not a safe rebase.
+
+        This is the comparison used only after a commit conflict; the success
+        path does not snapshot fragment identities.
+        """
+        from lance_ray.merge_into import (
+            _rebase_unsafe_fragments,
+            _snapshot_touched_fragment_identities,
+        )
+
+        path = Path(temp_dir) / "rebase_mor_metadata"
+        dataset = create_dataset_with_fragments(path, make_fragments(2, 10))
+        fragment_id = min(fragment.fragment_id for fragment in dataset.get_fragments())
+        baseline = _snapshot_touched_fragment_identities(dataset, {fragment_id})
+
+        lr.merge_into(
+            pa.table({"id": [0], "value": ["concurrent"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+
+        current = lance.dataset(str(path))
+        missing, changed = _rebase_unsafe_fragments(current, baseline)
+        assert missing == set()
+        assert changed == {fragment_id}
+
+    def test_rebase_allows_concurrent_append(self, temp_dir):
+        """Appends add fragments but must not look like a touched-fragment rewrite."""
+        from lance_ray.merge_into import (
+            _rebase_unsafe_fragments,
+            _snapshot_touched_fragment_identities,
+        )
+
+        path = Path(temp_dir) / "rebase_append"
+        dataset = create_dataset_with_fragments(path, make_fragments(1, 10))
+        fragment_id = dataset.get_fragments()[0].fragment_id
+        baseline = _snapshot_touched_fragment_identities(dataset, {fragment_id})
+
+        lr.write_lance(
+            ray.data.from_pandas(pd.DataFrame({"id": [100], "value": ["appended"]})),
+            str(path),
+            mode="append",
+            min_rows_per_file=1,
+            max_rows_per_file=1,
+        )
+
+        current = lance.dataset(str(path))
+        missing, changed = _rebase_unsafe_fragments(current, baseline)
+        assert missing == set()
+        assert changed == set()
+        current_ids = {
+            fragment.fragment_id for fragment in current.get_fragments()
+        }
+        assert fragment_id in current_ids
+
+
 class TestMergeIntoValidation:
     def test_requires_uri_or_namespace(self):
         with pytest.raises(ValueError, match="Must provide either"):
