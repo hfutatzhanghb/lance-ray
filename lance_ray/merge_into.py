@@ -29,8 +29,10 @@ to fit on the driver:
    merge-on-read: for every owned fragment the task writes a *deletion file*
    marking the matched rows dead (addressed by the ``_rowid`` values from
    the plan phase, so no fragment data is rescanned), and the replacement
-   values, together with the rows that had
-   no match, are appended as brand-new fragments.
+   values, together with the rows that had no match, are appended as
+   brand-new fragments. On datasets with stable row IDs, replacement
+   fragments keep the matched rows' logical ``_rowid`` values; inserts
+   receive newly assigned IDs.
 3. COMMIT (driver): the per-task results are unioned into a single
    ``lance.LanceOperation.Update`` and committed once, so the whole merge is
    one atomic version change (all-or-nothing). Concurrent appends are
@@ -359,6 +361,7 @@ def _apply_task(
     removed_fragment_ids: list[int] = []
     updated_fragments: list[bytes] = []
     replacement_parts: list[pa.Table] = []
+    replacement_row_ids: list[int] = []
     updated_rows = 0
     for fragment_id in tables_by_fragment:
         source_rows = pa.concat_tables(tables_by_fragment[fragment_id])
@@ -378,22 +381,26 @@ def _apply_task(
         else:
             updated_fragments.append(pickle.dumps(new_meta))
         replacement_parts.append(source_rows)
+        replacement_row_ids.extend(row_ids)
         updated_rows += source_rows.num_rows
 
-    # Replacement rows and inserts are all full rows in target-schema order
-    # (aligned in the plan phase), so they are appended together in one write.
     inserted_rows = sum(t.num_rows for t in insert_parts)
     new_fragments: list[bytes] = []
     append_parts = replacement_parts + insert_parts
+    uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
     if append_parts:
+        # Replacements are written first so a prefix RowIdSequence can bind
+        # matched logical ids; commit assigns new ids to any trailing inserts.
         append_table = pa.concat_tables(append_parts)
-        fragments = lance.fragment.write_fragments(
+        fragments = _write_append_fragments(
             append_table,
             uri,
-            mode="append",
-            storage_options=storage_options or None,
-            **write_kwargs,
+            storage_options,
+            write_kwargs,
+            enable_stable_row_ids=uses_stable_row_ids,
         )
+        if uses_stable_row_ids and replacement_row_ids:
+            fragments = _attach_preserved_row_ids(fragments, replacement_row_ids)
         new_fragments.extend(pickle.dumps(f) for f in fragments)
 
     return {
@@ -567,6 +574,51 @@ def _commit_update(
         raise exc
 
 
+def _attach_preserved_row_ids(fragments: list[Any], row_ids: list[int]) -> list[Any]:
+    """Bind preserved ``_rowid`` values onto newly written fragments.
+
+    ``row_ids`` is a prefix of the concatenated replacement-then-insert
+    table: each fragment takes as many ids as it has physical rows, and a
+    trailing fragment may receive fewer ids than rows. Lance fills those
+    remaining rows with newly assigned ids at commit.
+    """
+    from lance.fragment import RowIdSequence
+
+    remaining = list(row_ids)
+    for fragment in fragments:
+        if not remaining:
+            break
+        take = min(fragment.physical_rows, len(remaining))
+        fragment.row_id_meta = RowIdSequence(remaining[:take]).to_inline_metadata()
+        remaining = remaining[take:]
+    if remaining:
+        raise RuntimeError(
+            "Internal error: leftover replacement row ids after attaching "
+            f"to fragments ({len(remaining)})"
+        )
+    return fragments
+
+
+def _write_append_fragments(
+    table: pa.Table,
+    uri: str,
+    storage_options: Optional[dict[str, Any]],
+    write_kwargs: dict[str, Any],
+    *,
+    enable_stable_row_ids: bool = False,
+) -> list[Any]:
+    if table.num_rows == 0:
+        return []
+    return lance.fragment.write_fragments(
+        table,
+        uri,
+        mode="append",
+        storage_options=storage_options or None,
+        enable_stable_row_ids=enable_stable_row_ids,
+        **write_kwargs,
+    )
+
+
 def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
@@ -656,9 +708,10 @@ def merge_into(
     the updates (each fragment owned by exactly one
     worker): matched rows are masked out with per-fragment deletion files,
     and replacement plus insert rows are
-    appended as new fragments. All changes are committed as a single atomic
-    version. Scans filter through the deletion vectors until the next
-    compaction folds them away.
+    appended as new fragments. On datasets with stable row IDs, updated
+    rows keep their logical ``_rowid``. All changes are committed as a
+    single atomic version. Scans filter through the deletion vectors until
+    the next compaction folds them away.
 
     Concurrency: conflict detection is fragment-level. Concurrent appends
     that land during the merge_into are rebased inside

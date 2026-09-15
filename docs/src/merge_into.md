@@ -7,7 +7,7 @@ The whole operation commits as a **single atomic version** — readers see eithe
 ## How it works
 
 1. **Plan (distributed):** the source is split into chunks; each Ray task maps its keys to their target fragments using batched index lookups on the join key column, then routes rows to per-worker buckets keyed by target fragment (a map-side shuffle). The driver only handles object references and small metadata — source rows never pass through it.
-2. **Apply (distributed):** each Ray task owns a disjoint set of target fragments. Updates are merge-on-read: the task masks the matched rows of every owned fragment with a deletion vector (fragment data files are never rewritten), and appends the replacement values together with unmatched rows as new fragments. Scans filter through the deletion vectors until the next compaction folds them away.
+2. **Apply (distributed):** each Ray task owns a disjoint set of target fragments. Updates are merge-on-read: the task masks the matched rows of every owned fragment with a deletion vector (fragment data files are never rewritten), and appends the replacement values together with unmatched rows as new fragments. On datasets with stable row IDs, replacement fragments keep the matched rows' logical `_rowid` values; inserts receive newly assigned IDs. Scans filter through the deletion vectors until the next compaction folds them away.
 3. **Commit (driver):** all per-task results are unioned into one `lance.LanceOperation.Update` and committed once. Concurrent appends are rebased inside `LanceDataset.commit`. If that call raises after the write is already in the latest manifest, `merge_into` still returns that dataset.
 
 ## `merge_into`

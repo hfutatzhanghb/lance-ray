@@ -71,6 +71,17 @@ def id_to_value(dataset):
     )
 
 
+def id_to_rowid(dataset):
+    table = dataset.to_table(columns=["id"], with_row_id=True)
+    return dict(
+        zip(
+            table.column("id").to_pylist(),
+            table.column("_rowid").to_pylist(),
+            strict=True,
+        )
+    )
+
+
 class TestMergeInto:
     def test_basic_merge_into(self, temp_dir):
         """Update rows in several fragments and insert new rows atomically."""
@@ -234,11 +245,12 @@ class TestMergeInto:
         assert values[200] == "d"
 
     def test_merge_into_with_stable_row_ids(self, temp_dir):
-        """_rowaddr-based planning is correct on stable-row-id datasets."""
+        """Updated keys keep their logical _rowid; inserts get a new id."""
         path = Path(temp_dir) / "stable_row_ids"
-        create_dataset_with_fragments(
+        dataset = create_dataset_with_fragments(
             path, make_fragments(2, 10), enable_stable_row_ids=True
         )
+        before_ids = id_to_rowid(dataset)
 
         source = pa.table({"id": [4, 14, 300], "value": ["new_4", "new_14", "new_300"]})
         updated = lr.merge_into(source, str(path), on="id", num_workers=2)
@@ -249,6 +261,13 @@ class TestMergeInto:
         assert values[4] == "new_4"
         assert values[14] == "new_14"
         assert values[300] == "new_300"
+
+        after_ids = id_to_rowid(dataset)
+        assert after_ids[4] == before_ids[4]
+        assert after_ids[14] == before_ids[14]
+        assert after_ids[0] == before_ids[0]
+        assert after_ids[19] == before_ids[19]
+        assert after_ids[300] not in before_ids.values()
 
     def test_string_join_keys(self, temp_dir):
         """String keys (including quotes) are escaped correctly in lookups."""
