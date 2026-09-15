@@ -462,6 +462,87 @@ class TestMergeIntoMergeOnRead:
         assert all(values[i] == f"orig_{i}" for i in range(5, 10))
 
 
+class TestMergeIntoCommitAck:
+    def test_operation_visible_after_insert_only(self, temp_dir):
+        """New-fragment paths identify a committed insert-only merge."""
+        from lance_ray.merge_into import _merge_operation_visible
+
+        path = Path(temp_dir) / "ack_visible_insert"
+        dataset = create_dataset_with_fragments(path, make_fragments(1, 10))
+        read_version = dataset.version
+        baseline_ids = {fragment.fragment_id for fragment in dataset.get_fragments()}
+
+        updated = lr.merge_into(
+            pa.table({"id": [100, 101], "value": ["new_100", "new_101"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+        new_fragments = [
+            fragment.metadata
+            for fragment in updated.get_fragments()
+            if fragment.fragment_id not in baseline_ids
+        ]
+        assert new_fragments
+        assert _merge_operation_visible(
+            updated,
+            new_fragments=new_fragments,
+            updated_fragments=[],
+            removed_fragment_ids=[],
+        )
+        pinned = lance.dataset(str(path), version=read_version)
+        assert not _merge_operation_visible(
+            pinned,
+            new_fragments=new_fragments,
+            updated_fragments=[],
+            removed_fragment_ids=[],
+        )
+
+    def test_lost_commit_ack_returns_committed_table(self, temp_dir, monkeypatch):
+        """A raised commit after a successful PUT must not fail merge_into."""
+        path = Path(temp_dir) / "ack_lost"
+        create_dataset_with_fragments(path, make_fragments(1, 10))
+        real_commit = lance.LanceDataset.commit
+
+        def commit_then_lose_ack(*args, **kwargs):
+            real_commit(*args, **kwargs)
+            raise RuntimeError("lost ack")
+
+        monkeypatch.setattr(lance.LanceDataset, "commit", commit_then_lose_ack)
+
+        updated = lr.merge_into(
+            pa.table({"id": [100], "value": ["new_100"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+
+        assert updated.count_rows() == 11
+        assert id_to_value(updated)[100] == "new_100"
+        assert lance.dataset(str(path)).count_rows() == 11
+
+    def test_failed_commit_is_not_treated_as_success(self, temp_dir, monkeypatch):
+        """A commit that never landed must still raise."""
+        path = Path(temp_dir) / "ack_not_visible"
+        dataset = create_dataset_with_fragments(path, make_fragments(1, 10))
+        version_before = dataset.version
+
+        def commit_fails(*args, **kwargs):
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(lance.LanceDataset, "commit", commit_fails)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            lr.merge_into(
+                pa.table({"id": [100], "value": ["new_100"]}),
+                str(path),
+                on="id",
+                num_workers=1,
+            )
+        assert lance.dataset(str(path)).version == version_before
+        assert lance.dataset(str(path)).count_rows() == 10
+
+
 class TestMergeIntoValidation:
     def test_requires_uri_or_namespace(self):
         with pytest.raises(ValueError, match="Must provide either"):

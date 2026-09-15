@@ -34,9 +34,11 @@ to fit on the driver:
 3. COMMIT (driver): the per-task results are unioned into a single
    ``lance.LanceOperation.Update`` and committed once, so the whole merge is
    one atomic version change (all-or-nothing). Concurrent appends are
-   rebased inside ``LanceDataset.commit``; a concurrent rewrite, remove, or
-   merge-on-read update of a fragment this merge modifies fails, and the
-   caller should re-run against the latest version.
+   rebased inside ``LanceDataset.commit``. If that call raises after the
+   operation is already visible in the latest manifest, the driver returns
+   the latest dataset instead of failing (so a caller retry cannot
+   double-insert). A concurrent rewrite, remove, or merge-on-read update of
+   a fragment this merge modifies still fails.
 
 Example:
     >>> import lance_ray as lr
@@ -465,6 +467,106 @@ def _bounded_map_shuffle(
     return results
 
 
+def _fragment_metadata(fragment: Any) -> Any:
+    return fragment.metadata if hasattr(fragment, "metadata") else fragment
+
+
+def _data_file_paths(fragment: Any) -> tuple[Any, ...]:
+    files = getattr(_fragment_metadata(fragment), "files", None) or ()
+    return tuple(getattr(data_file, "path", None) for data_file in files)
+
+
+def _deletion_file_identity(deletion_file: Any) -> tuple[Any, ...] | None:
+    if deletion_file is None:
+        return None
+    return (
+        getattr(deletion_file, "read_version", None),
+        getattr(deletion_file, "id", None),
+        getattr(deletion_file, "num_deleted_rows", None),
+        getattr(deletion_file, "file_type", None),
+        getattr(deletion_file, "base_id", None),
+    )
+
+
+def _merge_operation_visible(
+    dataset: "lance.LanceDataset",
+    *,
+    new_fragments: list[Any],
+    updated_fragments: list[Any],
+    removed_fragment_ids: list[int],
+) -> bool:
+    """Return True if ``dataset`` already contains this merge's commit payload."""
+    if not (new_fragments or updated_fragments or removed_fragment_ids):
+        return False
+    for fragment_id in removed_fragment_ids:
+        if dataset.get_fragment(fragment_id) is not None:
+            return False
+    for expected in new_fragments:
+        current = dataset.get_fragment(expected.id)
+        if current is None or _data_file_paths(current) != _data_file_paths(expected):
+            return False
+    for expected in updated_fragments:
+        current = dataset.get_fragment(expected.id)
+        if current is None:
+            return False
+        current_meta = _fragment_metadata(current)
+        if _data_file_paths(current_meta) != _data_file_paths(expected):
+            return False
+        if _deletion_file_identity(
+            getattr(current_meta, "deletion_file", None)
+        ) != _deletion_file_identity(getattr(expected, "deletion_file", None)):
+            return False
+    return True
+
+
+def _commit_update(
+    uri: str,
+    operation: "lance.LanceOperation.Update",
+    read_version: int,
+    storage_options: dict[str, Any],
+    namespace_kwargs: dict[str, Any],
+    new_fragments: list[Any],
+    updated_fragments: list[Any],
+    removed_fragment_ids: list[int],
+) -> "lance.LanceDataset":
+    """Commit ``operation``, treating a lost success ack as success.
+
+    Does not retry by submitting a second transaction. If ``commit`` raises
+    but the latest manifest already contains this operation's fragments,
+    return that dataset so a caller retry cannot double-apply an insert.
+    """
+    try:
+        return lance.LanceDataset.commit(
+            uri,
+            operation,
+            read_version=read_version,
+            storage_options=storage_options or None,
+            **namespace_kwargs,
+        )
+    except Exception as exc:
+        try:
+            latest = lance.LanceDataset(
+                uri,
+                storage_options=storage_options or None,
+                **namespace_kwargs,
+            )
+        except Exception:  # noqa: BLE001 - probe failed; surface the commit error
+            raise exc from None
+        if latest.version > read_version and _merge_operation_visible(
+            latest,
+            new_fragments=new_fragments,
+            updated_fragments=updated_fragments,
+            removed_fragment_ids=removed_fragment_ids,
+        ):
+            logger.info(
+                "merge_into commit raised after the operation was already "
+                "visible at version %d; returning the latest dataset",
+                latest.version,
+            )
+            return latest
+        raise exc
+
+
 def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
@@ -563,7 +665,10 @@ def merge_into(
     ``LanceDataset.commit``; a concurrent commit that rewrote, removed, or
     updated-in-place (new deletion file / fragment metadata) any fragment
     this merge_into touches fails -- re-run against the latest version.
-    Two concurrent merge_into calls inserting
+    If ``commit`` raises after this operation is already visible in the
+    latest manifest (lost success ack), the call still returns that
+    dataset so a job-level retry cannot double-insert. Two concurrent
+    merge_into calls inserting
     the same *new* key are physically disjoint and would both succeed,
     duplicating the key; serialize merge_into against the same table to
     avoid this.
@@ -754,12 +859,15 @@ def merge_into(
         update_mode="rewrite_rows",
     )
 
-    committed = lance.LanceDataset.commit(
+    committed = _commit_update(
         uri,
         operation,
-        read_version=read_version,
-        storage_options=storage_options or None,
-        **namespace_kwargs,
+        read_version,
+        storage_options,
+        namespace_kwargs,
+        new_fragments,
+        updated,
+        removed,
     )
     logger.info(
         "merge_into committed version %d: %d row(s) updated, %d row(s) "
