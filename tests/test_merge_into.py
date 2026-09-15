@@ -269,6 +269,92 @@ class TestMergeInto:
         assert after_ids[19] == before_ids[19]
         assert after_ids[300] not in before_ids.values()
 
+    def test_target_one_to_many_updates_all_matches(self, temp_dir):
+        """A source key that hits several target rows updates every match."""
+        path = Path(temp_dir) / "target_one_to_many"
+        create_dataset_with_fragments(
+            path,
+            [
+                pd.DataFrame({"id": [1, 1, 2], "value": ["a", "b", "c"]}),
+            ],
+        )
+        source = pa.table({"id": [1, 3], "value": ["z", "new_3"]})
+        updated = lr.merge_into(source, str(path), on="id", num_workers=2)
+
+        assert updated.count_rows() == 4
+        table = updated.to_table()
+        pairs = list(
+            zip(
+                table.column("id").to_pylist(),
+                table.column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert pairs.count((1, "z")) == 2
+        assert (2, "c") in pairs
+        assert (3, "new_3") in pairs
+
+    def test_target_one_to_many_across_fragments(self, temp_dir):
+        """Matches on the same key in different fragments are all updated."""
+        path = Path(temp_dir) / "target_one_to_many_frags"
+        create_dataset_with_fragments(
+            path,
+            [
+                pd.DataFrame({"id": [1, 2], "value": ["a", "keep_2"]}),
+                pd.DataFrame({"id": [1, 3], "value": ["b", "keep_3"]}),
+            ],
+        )
+        source = pa.table({"id": [1], "value": ["z"]})
+        updated = lr.merge_into(source, str(path), on="id", num_workers=2)
+
+        assert updated.count_rows() == 4
+        table = updated.to_table()
+        pairs = list(
+            zip(
+                table.column("id").to_pylist(),
+                table.column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert pairs.count((1, "z")) == 2
+        assert (2, "keep_2") in pairs
+        assert (3, "keep_3") in pairs
+
+    def test_target_one_to_many_preserves_stable_row_ids(self, temp_dir):
+        """Join-all keeps every matched logical _rowid."""
+        path = Path(temp_dir) / "target_one_to_many_stable"
+        dataset = create_dataset_with_fragments(
+            path,
+            [pd.DataFrame({"id": [1, 1, 2], "value": ["a", "b", "c"]})],
+            enable_stable_row_ids=True,
+        )
+        before_table = dataset.to_table(columns=["id"], with_row_id=True)
+        before_ids = [
+            rowid
+            for key, rowid in zip(
+                before_table.column("id").to_pylist(),
+                before_table.column("_rowid").to_pylist(),
+                strict=True,
+            )
+            if key == 1
+        ]
+
+        source = pa.table({"id": [1], "value": ["z"]})
+        updated = lr.merge_into(source, str(path), on="id", num_workers=1)
+
+        after_table = updated.to_table(columns=["id", "value"], with_row_id=True)
+        after_pairs = list(
+            zip(
+                after_table.column("id").to_pylist(),
+                after_table.column("value").to_pylist(),
+                after_table.column("_rowid").to_pylist(),
+                strict=True,
+            )
+        )
+        updated_ids = sorted(rowid for key, value, rowid in after_pairs if key == 1)
+        assert updated_ids == sorted(before_ids)
+        assert all(value == "z" for key, value, _ in after_pairs if key == 1)
+
     def test_string_join_keys(self, temp_dir):
         """String keys (including quotes) are escaped correctly in lookups."""
         path = Path(temp_dir) / "string_keys"

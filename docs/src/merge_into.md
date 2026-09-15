@@ -1,6 +1,6 @@
 # Distributed Merge Into
 
-`merge_into` merges a source dataset into a target Lance table by join key: rows whose key already exists in the target are **updated** (all columns replaced), and rows with a new key are **inserted**. It is the distributed counterpart of pylance's `LanceDataset.merge_insert`, designed for sources and targets that are too large to process on a single machine.
+`merge_into` merges a source dataset into a target Lance table by join key: every target row whose key exists in the source is **updated** (all columns replaced; if the key is duplicated in the target, every matching row is updated), and source rows with a new key are **inserted**. It is the distributed counterpart of pylance's `LanceDataset.merge_insert`, designed for sources and targets that are too large to process on a single machine.
 
 The whole operation commits as a **single atomic version** — readers see either the old table or the fully merged table, never an intermediate state.
 
@@ -34,7 +34,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 
 - `ds`: The source rows, as a `ray.data.Dataset` or a `pyarrow.Table`. The source must contain every column of the target schema (columns are reordered/cast as needed) and must not contain null join keys. Duplicate join keys are deduplicated, keeping one arbitrary occurrence per key (which copy survives is unspecified).
 - `uri`: Target dataset URI (either `uri` OR `namespace_impl` + `table_id` required)
-- `on`: Join key column name (required, keyword-only). A scalar index on this column is strongly recommended for large targets (the plan phase falls back to filtered scans without one).
+- `on`: Join key column name (required, keyword-only). A scalar index on this column is strongly recommended for large targets (the plan phase falls back to filtered scans without one). Every matching target row is updated (join-all, same as pylance `merge_insert`).
 - `table_id`: Table identifier as a list of strings (requires `namespace_impl`)
 - `namespace_impl`: Namespace implementation type (e.g., `"rest"`, `"dir"`)
 - `namespace_properties`: Properties for connecting to the namespace

@@ -4,8 +4,10 @@
 """Distributed merge for Lance datasets on Ray.
 
 This module provides a fragment-parallel, atomic merge: every source row that
-matches a target row on the join key replaces that row (all columns), and
-every source row with no match is inserted. The plan executes across Ray
+matches a target row on the join key replaces that row (all columns). If
+the same key appears more than once in the target, every matching target
+row is updated (join-all, matching pylance ``merge_insert``). Every
+source row with no match is inserted. The plan executes across Ray
 workers so that neither the source rows nor the rewritten fragments ever have
 to fit on the driver:
 
@@ -128,10 +130,22 @@ def _align_chunk(chunk: pa.Table, target_schema: pa.Schema, on: str) -> pa.Table
 def _raise_on_duplicate_keys(keys: list, on: str, context: str) -> None:
     if len(keys) != len(set(keys)):
         raise ValueError(
-            f"Duplicate join keys detected ({context}). Each source row must "
-            f"match at most one target row; the dedupe pass keeps one row "
-            f"per {on!r} key, so this indicates an internal routing error."
+            f"Duplicate join keys detected ({context}). Source rows are "
+            f"deduplicated to one row per {on!r} key, so this indicates "
+            "an internal routing error."
         )
+
+
+def _raise_on_duplicate_rowids(row_ids: list[int], context: str) -> None:
+    if len(row_ids) != len(set(row_ids)):
+        raise RuntimeError(
+            f"Duplicate target row ids detected ({context}). Each matched "
+            "target row must be updated at most once."
+        )
+
+
+def _with_rowid_column(table: pa.Table, row_ids: list[int]) -> pa.Table:
+    return table.append_column(_ROWID_COLUMN, pa.array(row_ids, type=pa.int64()))
 
 
 def _key_bucket(key: Any, n: int) -> int:
@@ -228,8 +242,9 @@ def _plan_task(
     # Batched index lookups: only the key column plus _rowaddr and _rowid
     # are materialized. _rowaddr >> 32 is the physical fragment id (the
     # shuffle key); _rowid is what the apply phase deletes by, so matched
-    # rows never have to be re-found by rescanning the fragment.
-    rowinfo_of: dict[Any, tuple[int, int]] = {}  # key -> (fragment id, rowid)
+    # rows never have to be re-found by rescanning the fragment. A key may
+    # hit several target rows (join-all); every hit is kept.
+    matches_of: dict[Any, list[tuple[int, int]]] = collections.defaultdict(list)
     for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
         in_list = ", ".join(_sql_literal(key) for key in batch)
         # Backticks are Lance's identifier quoting (double quotes would be
@@ -246,42 +261,46 @@ def _plan_task(
             hits.column("_rowid").to_pylist(),
             strict=False,
         ):
-            rowinfo_of[key] = (rowaddr >> 32, rowid)
+            matches_of[key].append((rowaddr >> 32, rowid))
 
-    fragment_ids = [rowinfo_of.get(key, (-1, -1))[0] for key in keys]
-    row_ids = [rowinfo_of.get(key, (-1, -1))[1] for key in keys]
-    num_matched = sum(1 for f in fragment_ids if f != -1)
-
-    # Ship each row's target rowid with it so every bucket slice below
-    # carries the ids of the target rows it replaces (-1 on insert rows).
-    source_chunk = source_chunk.append_column(
-        _ROWID_COLUMN, pa.array(row_ids, type=pa.int64())
-    )
-
-    # Map-side shuffle: route each row to its owner's bucket. Matched rows go
-    # to owner(fragment_id); inserts are spread round-robin.
-    updates_by_owner: list[dict[int, list[int]]] = [
+    # Map-side shuffle: each target match is routed to owner(fragment_id).
+    # One source row can therefore appear in several buckets (or twice in
+    # the same fragment bucket) when the target key is not unique. Inserts
+    # are spread round-robin.
+    updates_by_owner: list[dict[int, list[tuple[int, int]]]] = [
         collections.defaultdict(list) for _ in range(n_apply)
     ]
     inserts_by_owner: list[list[int]] = [[] for _ in range(n_apply)]
-    for i, fragment_id in enumerate(fragment_ids):
-        if fragment_id == -1:
+    num_matched = 0
+    touched_fragments: set[int] = set()
+    for i, key in enumerate(keys):
+        hits = matches_of.get(key)
+        if not hits:
             inserts_by_owner[i % n_apply].append(i)
-        else:
-            updates_by_owner[_key_bucket(fragment_id, n_apply)][fragment_id].append(i)
+            continue
+        num_matched += len(hits)
+        for fragment_id, rowid in hits:
+            touched_fragments.add(fragment_id)
+            updates_by_owner[_key_bucket(fragment_id, n_apply)][fragment_id].append(
+                (i, rowid)
+            )
 
     buckets = []
     bucket_rows: list[int] = []
     for owner in range(n_apply):
-        frags = {
-            fragment_id: source_chunk.take(indices)
-            for fragment_id, indices in updates_by_owner[owner].items()
-        }
-        inserts = (
-            source_chunk.take(inserts_by_owner[owner])
-            if inserts_by_owner[owner]
-            else None
-        )
+        frags: dict[int, pa.Table] = {}
+        for fragment_id, pairs in updates_by_owner[owner].items():
+            indices = [index for index, _ in pairs]
+            row_ids = [rowid for _, rowid in pairs]
+            frags[fragment_id] = _with_rowid_column(
+                source_chunk.take(indices), row_ids
+            )
+        inserts = None
+        if inserts_by_owner[owner]:
+            insert_table = source_chunk.take(inserts_by_owner[owner])
+            inserts = _with_rowid_column(
+                insert_table, [-1] * insert_table.num_rows
+            )
         buckets.append({"frags": frags, "inserts": inserts})
         bucket_rows.append(
             sum(t.num_rows for t in frags.values())
@@ -292,7 +311,7 @@ def _plan_task(
         "label": f"plan-{task_id}",
         "rows": len(keys),
         "matched": num_matched,
-        "touched_fragments": sorted({f for f in fragment_ids if f != -1}),
+        "touched_fragments": sorted(touched_fragments),
         "bucket_rows": bucket_rows,
         "elapsed_s": time.perf_counter() - t0,
     }
@@ -365,14 +384,13 @@ def _apply_task(
     updated_rows = 0
     for fragment_id in tables_by_fragment:
         source_rows = pa.concat_tables(tables_by_fragment[fragment_id])
-        keys = source_rows.column(on).to_pylist()
-        # Duplicates that landed on the same target fragment (possibly from
-        # different plan chunks) are caught here.
-        _raise_on_duplicate_keys(keys, on, f"target fragment {fragment_id}")
         # Mark the matched rows dead with a deletion file, addressed by the
         # rowids gathered in the plan phase. A key predicate would force the
         # delete to rescan and decode the fragment's key column thus avoided.
+        # Join-all may place the same source key on this fragment more than
+        # once (one copy per matching target rowid).
         row_ids = source_rows.column(_ROWID_COLUMN).to_pylist()
+        _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
         source_rows = source_rows.drop_columns([_ROWID_COLUMN])
         in_list = ", ".join(str(rowid) for rowid in row_ids)
         new_meta = fragment_by_id[fragment_id].delete(f"_rowid IN ({in_list})")
@@ -708,7 +726,8 @@ def merge_into(
     the updates (each fragment owned by exactly one
     worker): matched rows are masked out with per-fragment deletion files,
     and replacement plus insert rows are
-    appended as new fragments. On datasets with stable row IDs, updated
+    appended as new fragments. If a join key matches several target rows,
+    every matching row is updated. On datasets with stable row IDs, updated
     rows keep their logical ``_rowid``. All changes are committed as a
     single atomic version. Scans filter through the deletion vectors until
     the next compaction folds them away.
@@ -738,7 +757,8 @@ def merge_into(
             (``namespace_impl`` + ``table_id``) must be provided.
         on: The join key column name. A scalar index on this column is
             strongly recommended for large targets (the plan phase falls
-            back to filtered scans without one).
+            back to filtered scans without one). Every target row whose
+            key matches a source row is updated (join-all).
         table_id: The table identifier as a list of strings. Must be provided
             together with ``namespace_impl``.
         namespace_impl: The namespace implementation type (e.g. ``"rest"``,
