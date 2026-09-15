@@ -33,11 +33,10 @@ to fit on the driver:
    no match, are appended as brand-new fragments.
 3. COMMIT (driver): the per-task results are unioned into a single
    ``lance.LanceOperation.Update`` and committed once, so the whole merge is
-   one atomic version change (all-or-nothing). Conflict detection is
-   fragment-level: concurrent appends are rebased over with bounded retries,
-   while a concurrent commit that removed, rewrote, or updated-in-place
-   (new deletion file / fragment metadata) any fragment this merge modifies
-   fails with an explicit error.
+   one atomic version change (all-or-nothing). Concurrent appends are
+   rebased inside ``LanceDataset.commit``; a concurrent rewrite, remove, or
+   merge-on-read update of a fragment this merge modifies fails, and the
+   caller should re-run against the latest version.
 
 Example:
     >>> import lance_ray as lr
@@ -72,8 +71,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_COMMIT_MAX_RETRIES = 3
-_COMMIT_RETRY_DELAY_S = 1.0
 # Number of join keys per ``IN (...)`` index lookup in the plan phase.
 _LOOKUP_BATCH_SIZE = 10_000
 
@@ -468,150 +465,6 @@ def _bounded_map_shuffle(
     return results
 
 
-def _fragment_metadata(fragment: Any) -> Any:
-    return fragment.metadata if hasattr(fragment, "metadata") else fragment
-
-
-def _deletion_file_identity(deletion_file: Any) -> tuple[Any, ...] | None:
-    if deletion_file is None:
-        return None
-    return (
-        getattr(deletion_file, "read_version", None),
-        getattr(deletion_file, "id", None),
-        getattr(deletion_file, "num_deleted_rows", None),
-        getattr(deletion_file, "file_type", None),
-        getattr(deletion_file, "base_id", None),
-    )
-
-
-def _fragment_rebase_identity(fragment: Any) -> tuple[Any, ...]:
-    """Identity of fields merge-on-read mutates without changing fragment id."""
-    meta = _fragment_metadata(fragment)
-    files = getattr(meta, "files", None) or ()
-    return (
-        getattr(meta, "id", getattr(fragment, "fragment_id", None)),
-        tuple(getattr(data_file, "path", None) for data_file in files),
-        _deletion_file_identity(getattr(meta, "deletion_file", None)),
-        getattr(meta, "physical_rows", None),
-    )
-
-
-def _snapshot_touched_fragment_identities(
-    dataset: "lance.LanceDataset", touched_fragment_ids: set[int]
-) -> dict[int, tuple[Any, ...]]:
-    """Capture rebase identities for ``touched_fragment_ids`` at ``dataset``."""
-    if not touched_fragment_ids:
-        return {}
-    identities: dict[int, tuple[Any, ...]] = {}
-    for fragment_id in touched_fragment_ids:
-        fragment = dataset.get_fragment(fragment_id)
-        if fragment is not None:
-            identities[fragment_id] = _fragment_rebase_identity(fragment)
-    missing = touched_fragment_ids - identities.keys()
-    if missing:
-        raise RuntimeError(
-            "Internal error: touched fragments "
-            f"{sorted(missing)} are missing at the merge read version"
-        )
-    return identities
-
-
-def _rebase_unsafe_fragments(
-    current: "lance.LanceDataset",
-    baseline_identities: dict[int, tuple[Any, ...]],
-) -> tuple[set[int], set[int]]:
-    """Return (missing_ids, in_place_changed_ids) vs the merge read snapshot."""
-    missing: set[int] = set()
-    changed: set[int] = set()
-    for fragment_id, identity in baseline_identities.items():
-        fragment = current.get_fragment(fragment_id)
-        if fragment is None:
-            missing.add(fragment_id)
-        elif _fragment_rebase_identity(fragment) != identity:
-            changed.add(fragment_id)
-    return missing, changed
-
-
-def _commit_update_with_retry(
-    uri: str,
-    operation: "lance.LanceOperation.Update",
-    read_version: int,
-    storage_options: dict[str, Any],
-    namespace_kwargs: dict[str, Any],
-    touched_fragment_ids: set[int],
-) -> "lance.LanceDataset":
-    """Commit an Update operation, retrying on concurrent-commit conflicts.
-
-    The successful first commit does no extra fragment IO. On conflict the
-    original read version is compared with latest for each touched fragment:
-    a retry is only safe while those fragments still exist with the same
-    data-file paths and deletion-file identity. Merge-on-read writers keep
-    the fragment id and replace the deletion file; treating "id still
-    present" as safe would rebase stale ``updated_fragments`` over that
-    concurrent change. Concurrent appends do not mutate those identities
-    and can be rebased.
-    """
-    last_exc = None
-    original_read_version = read_version
-    baseline_identities: dict[int, tuple[Any, ...]] | None = None
-    for attempt in range(_COMMIT_MAX_RETRIES):
-        try:
-            return lance.LanceDataset.commit(
-                uri,
-                operation,
-                read_version=read_version,
-                storage_options=storage_options or None,
-                **namespace_kwargs,
-            )
-        except Exception as exc:
-            last_exc = exc
-            if attempt < _COMMIT_MAX_RETRIES - 1:
-                time.sleep(_COMMIT_RETRY_DELAY_S * (2**attempt))
-                try:
-                    current = lance.LanceDataset(
-                        uri,
-                        storage_options=storage_options or None,
-                        **namespace_kwargs,
-                    )
-                    if baseline_identities is None:
-                        baseline = lance.LanceDataset(
-                            uri,
-                            version=original_read_version,
-                            storage_options=storage_options or None,
-                            **namespace_kwargs,
-                        )
-                        baseline_identities = _snapshot_touched_fragment_identities(
-                            baseline, touched_fragment_ids
-                        )
-                    missing, changed = _rebase_unsafe_fragments(
-                        current, baseline_identities
-                    )
-                    if missing or changed:
-                        details: list[str] = []
-                        if missing:
-                            details.append(
-                                f"removed or rewritten: {sorted(missing)}"
-                            )
-                        if changed:
-                            details.append(
-                                "updated in place (deletion vector or metadata): "
-                                f"{sorted(changed)}"
-                            )
-                        raise ValueError(
-                            "Concurrent write detected: fragments this "
-                            "merge_into touches were modified by another "
-                            f"commit ({'; '.join(details)}). Cannot safely "
-                            "retry merge_into; re-run it against the latest "
-                            "version."
-                        ) from exc
-                    read_version = current.version
-                except ValueError:
-                    raise
-                except Exception:  # noqa: BLE001 - probe failure, retry blind
-                    pass
-    raise last_exc
-
-
 def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
@@ -706,11 +559,11 @@ def merge_into(
     compaction folds them away.
 
     Concurrency: conflict detection is fragment-level. Concurrent appends
-    that land during the merge_into are tolerated (the commit rebases with
-    bounded retries); a concurrent commit that rewrote, removed, or
+    that land during the merge_into are rebased inside
+    ``LanceDataset.commit``; a concurrent commit that rewrote, removed, or
     updated-in-place (new deletion file / fragment metadata) any fragment
-    this merge_into touches fails with an explicit error -- re-run
-    against the latest version. Two concurrent merge_into calls inserting
+    this merge_into touches fails -- re-run against the latest version.
+    Two concurrent merge_into calls inserting
     the same *new* key are physically disjoint and would both succeed,
     duplicating the key; serialize merge_into against the same table to
     avoid this.
@@ -901,13 +754,12 @@ def merge_into(
         update_mode="rewrite_rows",
     )
 
-    committed = _commit_update_with_retry(
+    committed = lance.LanceDataset.commit(
         uri,
         operation,
-        read_version,
-        storage_options,
-        namespace_kwargs,
-        set(touched_ids),
+        read_version=read_version,
+        storage_options=storage_options or None,
+        **namespace_kwargs,
     )
     logger.info(
         "merge_into committed version %d: %d row(s) updated, %d row(s) "
