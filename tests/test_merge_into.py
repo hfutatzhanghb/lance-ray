@@ -82,6 +82,16 @@ def id_to_rowid(dataset):
     )
 
 
+def test_rowaddr_parts_are_local_offsets():
+    """delete_rows takes fragment-local offsets, not packed _rowaddr/_rowid."""
+    from lance_ray.merge_into import _rowaddr_parts
+
+    assert _rowaddr_parts(0) == (0, 0)
+    assert _rowaddr_parts(17) == (0, 17)
+    assert _rowaddr_parts((1 << 32) | 5) == (1, 5)
+    assert _rowaddr_parts((3 << 32) | 0) == (3, 0)
+
+
 class TestMergeInto:
     def test_basic_merge_into(self, temp_dir):
         """Update rows in several fragments and insert new rows atomically."""
@@ -150,7 +160,11 @@ class TestMergeInto:
         assert values[101] == "new_101"
 
     def test_update_only_source(self, temp_dir):
-        """A source where every key matches only updates."""
+        """A source where every key matches only updates.
+
+        id 15 lives in fragment 1, so deletion must use the local offset
+        (not the packed ``_rowid`` / ``_rowaddr`` value).
+        """
         path = Path(temp_dir) / "update_only"
         create_dataset_with_fragments(path, make_fragments(2, 10))
 

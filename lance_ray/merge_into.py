@@ -29,8 +29,8 @@ to fit on the driver:
 2. APPLY (distributed): each apply task owns a disjoint set of target
    fragments (guaranteed by the ownership function). Updates are
    merge-on-read: for every owned fragment the task writes a *deletion file*
-   marking the matched rows dead (addressed by the ``_rowid`` values from
-   the plan phase, so no fragment data is rescanned), and the replacement
+   marking the matched rows dead (addressed by the physical offsets from
+   ``_rowaddr``, so no fragment data is rescanned), and the replacement
    values, together with the rows that had no match, are appended as
    brand-new fragments. On datasets with stable row IDs, replacement
    fragments keep the matched rows' logical ``_rowid`` values; inserts
@@ -80,13 +80,12 @@ logger = logging.getLogger(__name__)
 # Number of join keys per ``IN (...)`` index lookup in the plan phase.
 _LOOKUP_BATCH_SIZE = 10_000
 
-# Helper column shipped inside the plan buckets: the ``_rowid`` of the
-# matched target row, so the apply phase can delete rows directly without
-# rescanning the fragment for the keys. ``_rowid`` (not ``_rowaddr``) is the
-# id ``LanceFragment.delete`` resolves on BOTH dataset flavors: it equals the
-# physical row address on regular datasets and the stable id on
-# stable-row-id datasets (where ``_rowaddr`` predicates do not match).
+# Helper columns shipped inside the plan buckets for matched target rows.
+# ``_rowaddr``'s low 32 bits are the local physical offsets
+# ``LanceFragment.delete_rows`` consumes (valid on both dataset flavors).
+# Logical ``_rowid`` is kept so stable-row-id replacements can reuse it.
 _ROWID_COLUMN = "__merge_into_rowid"
+_OFFSET_COLUMN = "__merge_into_offset"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +145,20 @@ def _raise_on_duplicate_rowids(row_ids: list[int], context: str) -> None:
 
 def _with_rowid_column(table: pa.Table, row_ids: list[int]) -> pa.Table:
     return table.append_column(_ROWID_COLUMN, pa.array(row_ids, type=pa.int64()))
+
+
+def _with_match_identity(
+    table: pa.Table, row_ids: list[int], offsets: list[int]
+) -> pa.Table:
+    return _with_rowid_column(table, row_ids).append_column(
+        _OFFSET_COLUMN, pa.array(offsets, type=pa.int64())
+    )
+
+
+def _rowaddr_parts(rowaddr: int) -> tuple[int, int]:
+    """Split a Lance ``_rowaddr`` into ``(fragment_id, local_offset)``."""
+    addr = int(rowaddr)
+    return addr >> 32, addr & 0xFFFFFFFF
 
 
 def _key_bucket(key: Any, n: int) -> int:
@@ -241,10 +254,10 @@ def _plan_task(
     )
     # Batched index lookups: only the key column plus _rowaddr and _rowid
     # are materialized. _rowaddr >> 32 is the physical fragment id (the
-    # shuffle key); _rowid is what the apply phase deletes by, so matched
-    # rows never have to be re-found by rescanning the fragment. A key may
-    # hit several target rows (join-all); every hit is kept.
-    matches_of: dict[Any, list[tuple[int, int]]] = collections.defaultdict(list)
+    # shuffle key); the low 32 bits are the local offset delete_rows uses.
+    # _rowid is preserved for stable-row-id replacements. A key may hit
+    # several target rows (join-all); every hit is kept.
+    matches_of: dict[Any, list[tuple[int, int, int]]] = collections.defaultdict(list)
     for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
         in_list = ", ".join(_sql_literal(key) for key in batch)
         # Backticks are Lance's identifier quoting (double quotes would be
@@ -261,13 +274,14 @@ def _plan_task(
             hits.column("_rowid").to_pylist(),
             strict=False,
         ):
-            matches_of[key].append((rowaddr >> 32, rowid))
+            fragment_id, offset = _rowaddr_parts(rowaddr)
+            matches_of[key].append((fragment_id, int(rowid), offset))
 
     # Map-side shuffle: each target match is routed to owner(fragment_id).
     # One source row can therefore appear in several buckets (or twice in
     # the same fragment bucket) when the target key is not unique. Inserts
     # are spread round-robin.
-    updates_by_owner: list[dict[int, list[tuple[int, int]]]] = [
+    updates_by_owner: list[dict[int, list[tuple[int, int, int]]]] = [
         collections.defaultdict(list) for _ in range(n_apply)
     ]
     inserts_by_owner: list[list[int]] = [[] for _ in range(n_apply)]
@@ -279,10 +293,10 @@ def _plan_task(
             inserts_by_owner[i % n_apply].append(i)
             continue
         num_matched += len(hits)
-        for fragment_id, rowid in hits:
+        for fragment_id, rowid, offset in hits:
             touched_fragments.add(fragment_id)
             updates_by_owner[_key_bucket(fragment_id, n_apply)][fragment_id].append(
-                (i, rowid)
+                (i, rowid, offset)
             )
 
     buckets = []
@@ -290,10 +304,11 @@ def _plan_task(
     for owner in range(n_apply):
         frags: dict[int, pa.Table] = {}
         for fragment_id, pairs in updates_by_owner[owner].items():
-            indices = [index for index, _ in pairs]
-            row_ids = [rowid for _, rowid in pairs]
-            frags[fragment_id] = _with_rowid_column(
-                source_chunk.take(indices), row_ids
+            indices = [index for index, _, _ in pairs]
+            row_ids = [rowid for _, rowid, _ in pairs]
+            offsets = [offset for _, _, offset in pairs]
+            frags[fragment_id] = _with_match_identity(
+                source_chunk.take(indices), row_ids, offsets
             )
         inserts = None
         if inserts_by_owner[owner]:
@@ -340,9 +355,9 @@ def _apply_task(
 
     For each owned fragment the task writes
     a new *deletion file* marking the matched rows dead
-    (``LanceFragment.delete`` by ``_rowid``, using the ids gathered by the
-    plan phase's index lookups, so no fragment data is rescanned and
-    the data files are untouched); the
+    (``LanceFragment.delete_rows`` by local physical offset from
+    ``_rowaddr``, gathered by the plan phase's index lookups, so no
+    fragment data is rescanned and the data files are untouched); the
     replacement rows and the inserts are appended together as brand-new
     fragments. A fragment left empty by the deletion is removed instead.
 
@@ -385,16 +400,18 @@ def _apply_task(
     for fragment_id in tables_by_fragment:
         source_rows = pa.concat_tables(tables_by_fragment[fragment_id])
         # Mark the matched rows dead with a deletion file, addressed by the
-        # rowids gathered in the plan phase. A key predicate would force the
-        # delete to rescan and decode the fragment's key column thus avoided.
+        # physical offsets gathered in the plan phase. A key predicate would
+        # force the delete to rescan and decode the fragment's key column.
         # Join-all may place the same source key on this fragment more than
-        # once (one copy per matching target rowid).
+        # once (one copy per matching target row).
         row_ids = source_rows.column(_ROWID_COLUMN).to_pylist()
+        offsets = source_rows.column(_OFFSET_COLUMN).to_pylist()
         _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
-        source_rows = source_rows.drop_columns([_ROWID_COLUMN])
-        # Use native delete_rows to avoid unbounded SQL expression growth.
-        # Accepts physical row offsets directly, no string construction needed.
-        new_meta = fragment_by_id[fragment_id].delete_rows(row_ids)
+        _raise_on_duplicate_rowids(
+            offsets, f"target fragment {fragment_id} offsets"
+        )
+        source_rows = source_rows.drop_columns([_ROWID_COLUMN, _OFFSET_COLUMN])
+        new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)
         else:
