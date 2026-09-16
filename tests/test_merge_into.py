@@ -3,6 +3,7 @@
 
 """Test cases for lance_ray.merge_into (distributed merge_into)."""
 
+import collections
 import tempfile
 from pathlib import Path
 
@@ -90,6 +91,31 @@ def test_rowaddr_parts_are_local_offsets():
     assert _rowaddr_parts(17) == (0, 17)
     assert _rowaddr_parts((1 << 32) | 5) == (1, 5)
     assert _rowaddr_parts((3 << 32) | 0) == (3, 0)
+
+
+def test_pack_plan_buckets_omits_empty_owners():
+    """Shuffle payloads skip apply owners that received no rows."""
+    from lance_ray.merge_into import (
+        _OFFSET_COLUMN,
+        _ROWID_COLUMN,
+        _pack_plan_buckets,
+    )
+
+    chunk = pa.table({"id": [10, 20], "value": ["a", "b"]})
+    updates: list = [collections.defaultdict(list) for _ in range(4)]
+    updates[2][5].append((0, 99, 3))
+    inserts: list[list[int]] = [[] for _ in range(4)]
+    inserts[1] = [1]
+    owners, buckets, bucket_rows = _pack_plan_buckets(4, chunk, updates, inserts)
+    assert owners == [1, 2]
+    assert bucket_rows == [0, 1, 1, 0]
+    assert buckets[0]["frags"] == {}
+    assert buckets[0]["inserts"].num_rows == 1
+    assert _ROWID_COLUMN in buckets[0]["inserts"].column_names
+    matched = buckets[1]["frags"][5]
+    assert matched.num_rows == 1
+    assert matched.column(_OFFSET_COLUMN).to_pylist() == [3]
+    assert matched.column(_ROWID_COLUMN).to_pylist() == [99]
 
 
 class TestMergeInto:
@@ -221,7 +247,7 @@ class TestMergeInto:
                 assert values[i] == f"orig_{i}"
 
     def test_more_partitions_than_workers(self, temp_dir):
-        """num_partitions controls layout independently of num_workers."""
+        """num_partitions only splits the source; apply owners follow num_workers."""
         path = Path(temp_dir) / "partitions_vs_workers"
         create_dataset_with_fragments(path, make_fragments(4, 5))
 

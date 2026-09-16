@@ -6,7 +6,7 @@ The whole operation commits as a **single atomic version** — readers see eithe
 
 ## How it works
 
-1. **Plan (distributed):** the source is split into chunks; each Ray task maps its keys to their target fragments using batched index lookups on the join key column, then routes rows to per-worker buckets keyed by target fragment (a map-side shuffle). The driver only handles object references and small metadata — source rows never pass through it.
+1. **Plan (distributed):** the source is split into `num_partitions` chunks; each Ray task maps its keys to their target fragments using batched index lookups on the join key column, then routes rows to `num_workers` per-owner buckets keyed by target fragment. Only non-empty buckets are materialized. The driver only handles object references and small metadata — source rows never pass through it.
 2. **Apply (distributed):** each Ray task owns a disjoint set of target fragments. Updates are merge-on-read: the task masks the matched rows of every owned fragment with a deletion vector written from local physical offsets (`LanceFragment.delete_rows`; fragment data files are never rewritten), and appends the replacement values together with unmatched rows as new fragments. On datasets with stable row IDs, replacement fragments keep the matched rows' logical `_rowid` values; inserts receive newly assigned IDs. Scans filter through the deletion vectors until the next compaction folds them away.
 3. **Commit (driver):** all per-task results are unioned into one `lance.LanceOperation.Update` and committed once. Concurrent appends are rebased inside `LanceDataset.commit`. If that call raises after the write is already in the latest manifest, `merge_into` still returns that dataset.
 
@@ -39,9 +39,16 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 - `namespace_impl`: Namespace implementation type (e.g., `"rest"`, `"dir"`)
 - `namespace_properties`: Properties for connecting to the namespace
 - `storage_options`: Optional storage configuration dictionary
-- `num_workers`: Maximum number of Ray tasks running concurrently in each phase (default: 4). Lower it to reduce peak memory and IO pressure.
-- `num_partitions`: How the work is partitioned — the number of source chunks (plan phase) and fragment buckets (apply phase); default: `num_workers`. Raise it above `num_workers` to get smaller, more granular tasks on a memory-constrained cluster.
+- `num_workers`: Concurrent Ray tasks per phase **and** the number of apply-side fragment owners (default: 4). Ownership is `crc32(fragment_id) % num_workers`. Lower it to reduce peak memory, IO, and shuffle fan-out.
+- `num_partitions`: Number of source chunks for the plan phase only (default: `num_workers`). Raise this to shrink each plan task without creating more apply workers or a quadratic number of Ray objects.
 - `ray_remote_args`: Optional kwargs for Ray remote tasks (e.g., `num_cpus`)
+
+## Best practices
+
+- Size **`num_workers`** to the cluster slots you want busy during plan and apply (typically 8–64). This is also apply parallelism: each worker owns a disjoint subset of target fragments.
+- Raise **`num_partitions` above `num_workers`** when plan tasks are memory-heavy (large source chunks or expensive index probes). Example: `num_workers=8`, `num_partitions=32` runs 32 smaller plan tasks with at most 8 in flight, and still only 8 apply owners. Plan tasks yield only non-empty owner buckets, so empty plan→apply edges are not stored as Ray objects.
+- Do **not** set `num_partitions` in the hundreds or thousands expecting more apply workers. Apply fan-out follows `num_workers`. A large `num_partitions` only increases how many plan tasks run.
+- Create a scalar index (e.g. BTREE) on the join key before merging into large tables so planning is index lookups instead of filtered scans.
 
 ## Examples
 
@@ -53,7 +60,13 @@ import ray
 
 source = ray.data.read_parquet("s3://bucket/daily_updates/")
 
-dataset = lr.merge_into(source, "/path/to/table.lance", on="id", num_workers=8)
+dataset = lr.merge_into(
+    source,
+    "/path/to/table.lance",
+    on="id",
+    num_workers=8,
+    num_partitions=32,  # smaller plan tasks; still 8 apply owners
+)
 print(dataset.version)
 ```
 
@@ -74,4 +87,4 @@ dataset = lr.merge_into(
 - Each source row must match at most one target row. Duplicate source keys are always resolved automatically by a sort-based dedupe pass (a Ray Data sort of the source by key plus a vectorized adjacent-duplicate drop), keeping one arbitrary occurrence per key — which copy survives is unspecified.
 - Concurrent writes: appends that land during the merge_into are rebased inside `LanceDataset.commit`. If a concurrent commit rewrites, removes, or updates-in-place (new deletion file / fragment metadata) one of the fragments this merge_into touches (e.g. compaction or another merge-on-read update), the operation fails rather than silently dropping the concurrent change. If `commit` raises after this merge's fragments are already visible (lost success ack), the call returns the latest dataset instead of failing, so a job-level retry cannot double-insert.
 - Concurrent inserts of the same key: Lance's conflict detection is fragment-level, so two concurrent `merge_into` calls inserting the same *new* join key are physically disjoint — both commits succeed and the key is duplicated. Serialize `merge_into` against the same table externally (e.g. one scheduled writer). Key-level conflict detection is discussed as future work in the [design doc](merge-insert-design.md#112-key-level-conflict-detection-isolation-parity-with-native-merge_insert).
-- Create a scalar index (e.g. BTREE) on the join key column before calling `merge_into` on large tables — key-to-fragment planning is served by the index instead of scanning the table.
+- Create a scalar index (e.g. BTREE) on the join key column before calling `merge_into` on large tables — key-to-fragment planning is served by the index instead of scanning the table. See [Best practices](#best-practices).

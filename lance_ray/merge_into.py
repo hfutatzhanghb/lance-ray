@@ -22,8 +22,10 @@ to fit on the driver:
    against the target dataset (``_rowaddr >> 32`` = fragment id; served by the
    scalar index on the key column when one exists). Each plan task then
    hash-partitions its rows into per-apply-task buckets with a static
-   ownership function -- ``owner(fragment_id) = crc32(fragment_id) % n_apply``
-   -- and returns the buckets as separate Ray objects (a map-side shuffle). The
+   ownership function -- ``owner(fragment_id) = crc32(fragment_id) % num_workers``
+   -- and yields only the non-empty buckets as separate Ray objects (a
+   map-side shuffle). ``num_partitions`` only controls how many source
+   chunks (plan tasks) run; it does not multiply the apply fan-out. The
    driver only receives small metadata; bucket bytes move from plan node to
    apply node directly through the Ray object store.
 2. APPLY (distributed): each apply task owns a disjoint set of target
@@ -161,6 +163,46 @@ def _rowaddr_parts(rowaddr: int) -> tuple[int, int]:
     return addr >> 32, addr & 0xFFFFFFFF
 
 
+def _pack_plan_buckets(
+    n_apply: int,
+    source_chunk: pa.Table,
+    updates_by_owner: list[dict[int, list[tuple[int, int, int]]]],
+    inserts_by_owner: list[list[int]],
+) -> tuple[list[int], list[dict[str, Any]], list[int]]:
+    """Build apply-owner payloads, omitting owners with no rows.
+
+    Returns ``(owners, buckets, bucket_rows)``. ``owners`` and ``buckets``
+    are parallel and contain only non-empty slots; ``bucket_rows`` is dense
+    over ``range(n_apply)`` so callers can still log per-owner counts.
+    """
+    owners: list[int] = []
+    buckets: list[dict[str, Any]] = []
+    bucket_rows: list[int] = []
+    for owner in range(n_apply):
+        frags: dict[int, pa.Table] = {}
+        for fragment_id, pairs in updates_by_owner[owner].items():
+            indices = [index for index, _, _ in pairs]
+            row_ids = [rowid for _, rowid, _ in pairs]
+            offsets = [offset for _, _, offset in pairs]
+            frags[fragment_id] = _with_match_identity(
+                source_chunk.take(indices), row_ids, offsets
+            )
+        inserts = None
+        if inserts_by_owner[owner]:
+            insert_table = source_chunk.take(inserts_by_owner[owner])
+            inserts = _with_rowid_column(
+                insert_table, [-1] * insert_table.num_rows
+            )
+        rows = sum(t.num_rows for t in frags.values()) + (
+            inserts.num_rows if inserts is not None else 0
+        )
+        bucket_rows.append(rows)
+        if rows:
+            owners.append(owner)
+            buckets.append({"frags": frags, "inserts": inserts})
+    return owners, buckets, bucket_rows
+
+
 def _key_bucket(key: Any, n: int) -> int:
     """Deterministic key -> bucket assignment for the plan shuffle
     (apply-task ownership, bucket by fragment id). One property matters:
@@ -213,124 +255,107 @@ def _plan_task(
 ):
     """PLAN + map-side shuffle: map keys to target fragments, bucket by owner.
 
-    Declared with ``num_returns=n_apply + 1`` at the call site: the first
-    ``n_apply`` returns are the bucket payloads
-    ``{"frags": {fragment_id: rows}, "inserts": rows | None}`` and the last is
-    a small metadata dict. The driver only fetches the metadata; bucket bytes
-    stay in the object store on this node until the owning apply task pulls
-    them. Ownership is a pure function of the fragment id
-    (``crc32(fragment_id) % n_apply``), so every plan task routes a given
-    fragment to the same apply task without coordination -- that is what makes
-    the apply phase write-disjoint by construction. Hashing (rather than a raw
-    modulo) keeps the buckets balanced.
+    This is a Ray generator task: it yields one payload per *non-empty*
+    apply owner, then a small metadata dict. Empty owners are omitted so
+    object count tracks occupied plan-to-apply edges, not ``n_plan * n_apply``.
+    The driver only fetches the metadata; bucket bytes stay in the object
+    store on this node until the owning apply task pulls them. Ownership is
+    ``crc32(fragment_id) % n_apply`` (``n_apply`` is ``num_workers``), so
+    every plan task routes a given fragment to the same apply task without
+    coordination -- that is what makes the apply phase write-disjoint by
+    construction.
     """
     t0 = time.perf_counter()
     # The dedupe sort can leave some range partitions empty (fewer rows than
     # partitions); such blocks materialize as zero-column tables, so bail
     # out before schema alignment.
     if source_chunk.num_rows == 0:
-        meta = {
+        yield {
             "label": f"plan-{task_id}",
             "rows": 0,
             "matched": 0,
             "touched_fragments": [],
+            "bucket_owners": [],
             "bucket_rows": [0] * n_apply,
             "elapsed_s": time.perf_counter() - t0,
         }
-        return (*({"frags": {}, "inserts": None} for _ in range(n_apply)), meta)
-
-    namespace_kwargs = get_namespace_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-    source_chunk = _align_chunk(source_chunk, target_schema, on)
-    keys = source_chunk.column(on).to_pylist()
-    _raise_on_duplicate_keys(keys, on, f"plan task {task_id}")
-
-    dataset = lance.LanceDataset(
-        uri,
-        version=read_version,
-        storage_options=storage_options or None,
-        **namespace_kwargs,
-    )
-    # Batched index lookups: only the key column plus _rowaddr and _rowid
-    # are materialized. _rowaddr >> 32 is the physical fragment id (the
-    # shuffle key); the low 32 bits are the local offset delete_rows uses.
-    # _rowid is preserved for stable-row-id replacements. A key may hit
-    # several target rows (join-all); every hit is kept.
-    matches_of: dict[Any, list[tuple[int, int, int]]] = collections.defaultdict(list)
-    for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
-        in_list = ", ".join(_sql_literal(key) for key in batch)
-        # Backticks are Lance's identifier quoting (double quotes would be
-        # parsed as a string literal by the filter planner).
-        hits = dataset.to_table(
-            columns=[on],
-            filter=f"`{on}` IN ({in_list})",
-            with_row_address=True,
-            with_row_id=True,
+    else:
+        namespace_kwargs = get_namespace_kwargs(
+            namespace_impl, namespace_properties, table_id
         )
-        for key, rowaddr, rowid in zip(
-            hits.column(on).to_pylist(),
-            hits.column("_rowaddr").to_pylist(),
-            hits.column("_rowid").to_pylist(),
-            strict=False,
-        ):
-            fragment_id, offset = _rowaddr_parts(rowaddr)
-            matches_of[key].append((fragment_id, int(rowid), offset))
+        source_chunk = _align_chunk(source_chunk, target_schema, on)
+        keys = source_chunk.column(on).to_pylist()
+        _raise_on_duplicate_keys(keys, on, f"plan task {task_id}")
 
-    # Map-side shuffle: each target match is routed to owner(fragment_id).
-    # One source row can therefore appear in several buckets (or twice in
-    # the same fragment bucket) when the target key is not unique. Inserts
-    # are spread round-robin.
-    updates_by_owner: list[dict[int, list[tuple[int, int, int]]]] = [
-        collections.defaultdict(list) for _ in range(n_apply)
-    ]
-    inserts_by_owner: list[list[int]] = [[] for _ in range(n_apply)]
-    num_matched = 0
-    touched_fragments: set[int] = set()
-    for i, key in enumerate(keys):
-        hits = matches_of.get(key)
-        if not hits:
-            inserts_by_owner[i % n_apply].append(i)
-            continue
-        num_matched += len(hits)
-        for fragment_id, rowid, offset in hits:
-            touched_fragments.add(fragment_id)
-            updates_by_owner[_key_bucket(fragment_id, n_apply)][fragment_id].append(
-                (i, rowid, offset)
-            )
-
-    buckets = []
-    bucket_rows: list[int] = []
-    for owner in range(n_apply):
-        frags: dict[int, pa.Table] = {}
-        for fragment_id, pairs in updates_by_owner[owner].items():
-            indices = [index for index, _, _ in pairs]
-            row_ids = [rowid for _, rowid, _ in pairs]
-            offsets = [offset for _, _, offset in pairs]
-            frags[fragment_id] = _with_match_identity(
-                source_chunk.take(indices), row_ids, offsets
-            )
-        inserts = None
-        if inserts_by_owner[owner]:
-            insert_table = source_chunk.take(inserts_by_owner[owner])
-            inserts = _with_rowid_column(
-                insert_table, [-1] * insert_table.num_rows
-            )
-        buckets.append({"frags": frags, "inserts": inserts})
-        bucket_rows.append(
-            sum(t.num_rows for t in frags.values())
-            + (inserts.num_rows if inserts is not None else 0)
+        dataset = lance.LanceDataset(
+            uri,
+            version=read_version,
+            storage_options=storage_options or None,
+            **namespace_kwargs,
         )
+        # Batched index lookups: only the key column plus _rowaddr and _rowid
+        # are materialized. _rowaddr >> 32 is the physical fragment id (the
+        # shuffle key); the low 32 bits are the local offset delete_rows uses.
+        # _rowid is preserved for stable-row-id replacements. A key may hit
+        # several target rows (join-all); every hit is kept.
+        matches_of: dict[Any, list[tuple[int, int, int]]] = collections.defaultdict(
+            list
+        )
+        for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
+            in_list = ", ".join(_sql_literal(key) for key in batch)
+            # Backticks are Lance's identifier quoting (double quotes would be
+            # parsed as a string literal by the filter planner).
+            hits = dataset.to_table(
+                columns=[on],
+                filter=f"`{on}` IN ({in_list})",
+                with_row_address=True,
+                with_row_id=True,
+            )
+            for key, rowaddr, rowid in zip(
+                hits.column(on).to_pylist(),
+                hits.column("_rowaddr").to_pylist(),
+                hits.column("_rowid").to_pylist(),
+                strict=False,
+            ):
+                fragment_id, offset = _rowaddr_parts(rowaddr)
+                matches_of[key].append((fragment_id, int(rowid), offset))
 
-    meta = {
-        "label": f"plan-{task_id}",
-        "rows": len(keys),
-        "matched": num_matched,
-        "touched_fragments": sorted(touched_fragments),
-        "bucket_rows": bucket_rows,
-        "elapsed_s": time.perf_counter() - t0,
-    }
-    return (*buckets, meta)
+        # Map-side shuffle: each target match is routed to owner(fragment_id).
+        # One source row can therefore appear in several buckets (or twice in
+        # the same fragment bucket) when the target key is not unique. Inserts
+        # are spread round-robin.
+        updates_by_owner: list[dict[int, list[tuple[int, int, int]]]] = [
+            collections.defaultdict(list) for _ in range(n_apply)
+        ]
+        inserts_by_owner: list[list[int]] = [[] for _ in range(n_apply)]
+        num_matched = 0
+        touched_fragments: set[int] = set()
+        for i, key in enumerate(keys):
+            hits = matches_of.get(key)
+            if not hits:
+                inserts_by_owner[i % n_apply].append(i)
+                continue
+            num_matched += len(hits)
+            for fragment_id, rowid, offset in hits:
+                touched_fragments.add(fragment_id)
+                updates_by_owner[_key_bucket(fragment_id, n_apply)][
+                    fragment_id
+                ].append((i, rowid, offset))
+
+        owners, buckets, bucket_rows = _pack_plan_buckets(
+            n_apply, source_chunk, updates_by_owner, inserts_by_owner
+        )
+        for bucket in buckets:
+            yield bucket
+        yield {
+            "label": f"plan-{task_id}",
+            "rows": len(keys),
+            "matched": num_matched,
+            "touched_fragments": sorted(touched_fragments),
+            "bucket_owners": owners,
+            "bucket_rows": bucket_rows,
+            "elapsed_s": time.perf_counter() - t0,
+        }
 
 
 @ray.remote
@@ -478,30 +503,45 @@ def _bounded_map(remote_fn, arg_tuples: list[tuple], max_in_flight: int) -> list
 def _bounded_map_shuffle(
     remote_fn, arg_tuples: list[tuple], max_in_flight: int
 ) -> list[dict]:
-    """``_bounded_map`` for tasks declared with ``num_returns > 1``.
+    """``_bounded_map`` for plan tasks that yield a variable number of buckets.
 
-    Only the last return value (a small metadata dict) is fetched on the
-    driver; the data returns stay in the object store on the producing node
-    and are attached to the metadata as ``meta["bucket_refs"]``. Because the
-    returns are task outputs (not worker-side ``ray.put``), the driver owns
-    them and they survive Ray recycling idle worker processes between phases.
+    Each plan task is a Ray generator: non-empty owner payloads followed by a
+    metadata dict. The driver waits for the generator to finish, fetches only
+    the metadata, and keeps the bucket ObjectRefs (task outputs, not
+    worker-side ``ray.put``) so they survive idle-worker recycling. Those
+    refs are attached as ``meta["bucket_refs"]``, parallel to
+    ``meta["bucket_owners"]``.
     """
     total = len(arg_tuples)
     results: list[dict] = []
-    pending: dict = {}  # meta ObjectRef -> bucket ObjectRefs
+    pending: dict = {}  # wait-key ObjectRef -> ObjectRefGenerator
     i = 0
 
+    def _wait_key(gen: Any) -> Any:
+        completed = getattr(gen, "completed", None)
+        return completed() if callable(completed) else gen
+
     def _submit(j: int) -> None:
-        refs = remote_fn.remote(*arg_tuples[j])
-        pending[refs[-1]] = refs[:-1]  # meta is the last return value
+        gen = remote_fn.remote(*arg_tuples[j])
+        pending[_wait_key(gen)] = gen
 
     while i < total and len(pending) < max_in_flight:
         _submit(i)
         i += 1
     while pending:
-        ready_meta_refs, _ = ray.wait(list(pending), num_returns=1)
-        bucket_refs = pending.pop(ready_meta_refs[0])
-        meta = ray.get(ready_meta_refs[0])
+        ready, _ = ray.wait(list(pending), num_returns=1)
+        gen = pending.pop(ready[0])
+        refs = list(gen)
+        if not refs:
+            raise RuntimeError("Internal error: plan task returned no values")
+        meta = ray.get(refs[-1])
+        owners = meta.get("bucket_owners", [])
+        bucket_refs = refs[:-1]
+        if len(bucket_refs) != len(owners):
+            raise RuntimeError(
+                "Internal error: plan shuffle mismatch: "
+                f"{len(bucket_refs)} bucket(s) vs {len(owners)} owner(s)"
+            )
         meta["bucket_refs"] = bucket_refs
         results.append(meta)
         if i < total:
@@ -791,14 +831,13 @@ def merge_into(
         namespace_properties: Properties for connecting to the namespace.
         storage_options: Storage options for the dataset.
         num_workers: Maximum number of Ray tasks running concurrently in each
-            phase (default: 4). Lower it to reduce peak memory and IO
-            pressure without changing how the data is partitioned.
-        num_partitions: How the work is partitioned: the number of source
-            chunks in the plan phase and of fragment buckets in the apply
-            phase (default: ``num_workers``). Unlike ``num_workers``, this is
-            baked into the shuffle layout, so raise it to get smaller,
-            more granular tasks (e.g. ``num_partitions=32`` with
-            ``num_workers=8``).
+            phase, and the number of apply-side fragment owners (default: 4).
+            Fragment ownership is ``crc32(fragment_id) % num_workers``. Lower
+            it to reduce peak memory, IO, and shuffle fan-out.
+        num_partitions: Number of source chunks in the plan phase (default:
+            ``num_workers``). Raise it to make each plan task smaller without
+            creating more apply tasks or a quadratic number of Ray objects
+            (e.g. ``num_partitions=32`` with ``num_workers=8``).
         ray_remote_args: Options for the Ray tasks (e.g. ``num_cpus``,
             ``resources``).
 
@@ -865,9 +904,9 @@ def merge_into(
     chunk_refs = _source_to_chunk_refs(ds, on, num_partitions)
 
     # Phase 1: PLAN + map-side shuffle. Chunk refs are passed as top-level
-    # args (resolved on the worker); each plan task returns num_partitions
-    # bucket objects plus a small metadata dict.
-    plan_remote = _plan_task.options(num_returns=num_partitions + 1, **ray_remote_args)
+    # args (resolved on the worker). Each plan task yields one object per
+    # non-empty apply owner (``num_workers`` owners) plus metadata.
+    plan_remote = _plan_task.options(**ray_remote_args)
     plan_args = [
         (
             i,
@@ -880,7 +919,7 @@ def merge_into(
             table_id,
             chunk_ref,
             target_schema,
-            num_partitions,
+            num_workers,
         )
         for i, chunk_ref in enumerate(chunk_refs)
     ]
@@ -900,27 +939,27 @@ def merge_into(
     # Phase 2: route each bucket's ObjectRef to its owning apply task. The
     # refs are nested in a list on purpose so Ray does not resolve them on
     # the driver; the apply task fetches them node-to-node itself.
-    apply_args = []
-    for owner in range(num_partitions):
-        bucket_refs = [
-            meta["bucket_refs"][owner]
-            for meta in plan_results
-            if meta["bucket_rows"][owner]
-        ]
-        if bucket_refs:
-            apply_args.append(
-                (
-                    owner,
-                    uri,
-                    read_version,
-                    on,
-                    storage_options,
-                    namespace_impl,
-                    namespace_properties,
-                    table_id,
-                    bucket_refs,
-                )
-            )
+    refs_by_owner: dict[int, list] = collections.defaultdict(list)
+    for meta in plan_results:
+        for owner, ref in zip(
+            meta["bucket_owners"], meta["bucket_refs"], strict=True
+        ):
+            refs_by_owner[owner].append(ref)
+    apply_args = [
+        (
+            owner,
+            uri,
+            read_version,
+            on,
+            storage_options,
+            namespace_impl,
+            namespace_properties,
+            table_id,
+            refs_by_owner[owner],
+        )
+        for owner in range(num_workers)
+        if owner in refs_by_owner
+    ]
     apply_remote = _apply_task.options(**ray_remote_args)
     apply_results = (
         _bounded_map(apply_remote, apply_args, num_workers) if apply_args else []
