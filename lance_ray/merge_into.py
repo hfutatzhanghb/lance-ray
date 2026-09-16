@@ -392,8 +392,9 @@ def _apply_task(
         row_ids = source_rows.column(_ROWID_COLUMN).to_pylist()
         _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
         source_rows = source_rows.drop_columns([_ROWID_COLUMN])
-        in_list = ", ".join(str(rowid) for rowid in row_ids)
-        new_meta = fragment_by_id[fragment_id].delete(f"_rowid IN ({in_list})")
+        # Use native delete_rows to avoid unbounded SQL expression growth.
+        # Accepts physical row offsets directly, no string construction needed.
+        new_meta = fragment_by_id[fragment_id].delete_rows(row_ids)
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)
         else:
