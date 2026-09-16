@@ -526,10 +526,16 @@ def _merge_operation_visible(
     for fragment_id in removed_fragment_ids:
         if dataset.get_fragment(fragment_id) is not None:
             return False
-    for expected in new_fragments:
-        current = dataset.get_fragment(expected.id)
-        if current is None or _data_file_paths(current) != _data_file_paths(expected):
-            return False
+    if new_fragments:
+        # Uncommitted fragments from ``write_fragments`` carry a placeholder
+        # id (typically 0); the real id is assigned at commit time. Match by
+        # data file identity instead, which is stable across the commit.
+        committed_paths = {
+            _data_file_paths(fragment) for fragment in dataset.get_fragments()
+        }
+        for expected in new_fragments:
+            if _data_file_paths(expected) not in committed_paths:
+                return False
     for expected in updated_fragments:
         current = dataset.get_fragment(expected.id)
         if current is None:
