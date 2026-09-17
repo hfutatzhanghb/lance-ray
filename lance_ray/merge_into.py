@@ -54,10 +54,12 @@ Example:
 """
 
 import collections
+import datetime
 import logging
 import pickle
 import time
 import zlib
+from decimal import Decimal
 from typing import Any, Optional
 
 import lance
@@ -95,17 +97,157 @@ _OFFSET_COLUMN = "__merge_into_offset"
 # ---------------------------------------------------------------------------
 
 
-def _sql_literal(value: Any) -> str:
-    """Render a join-key value as a SQL literal for an ``IN (...)`` filter."""
-    if isinstance(value, str):
-        return "'" + value.replace("'", "''") + "'"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, int | float):
-        return repr(value)
+_JOIN_KEY_TYPE_HELP = (
+    "boolean, integer, floating, string, date, timestamp, time, decimal, "
+    "or binary"
+)
+
+
+def _unwrap_dictionary_type(arrow_type: pa.DataType) -> pa.DataType:
+    while pa.types.is_dictionary(arrow_type):
+        arrow_type = arrow_type.value_type
+    return arrow_type
+
+
+def _is_string_type(arrow_type: pa.DataType) -> bool:
+    return bool(
+        pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or getattr(pa.types, "is_string_view", lambda _t: False)(arrow_type)
+    )
+
+
+def _is_binary_type(arrow_type: pa.DataType) -> bool:
+    return bool(
+        pa.types.is_binary(arrow_type)
+        or pa.types.is_large_binary(arrow_type)
+        or pa.types.is_fixed_size_binary(arrow_type)
+        or getattr(pa.types, "is_binary_view", lambda _t: False)(arrow_type)
+    )
+
+
+def _is_supported_join_key_type(arrow_type: pa.DataType) -> bool:
+    arrow_type = _unwrap_dictionary_type(arrow_type)
+    return bool(
+        pa.types.is_boolean(arrow_type)
+        or pa.types.is_integer(arrow_type)
+        or pa.types.is_floating(arrow_type)
+        or _is_string_type(arrow_type)
+        or pa.types.is_date(arrow_type)
+        or pa.types.is_timestamp(arrow_type)
+        or pa.types.is_time(arrow_type)
+        or pa.types.is_decimal(arrow_type)
+        or _is_binary_type(arrow_type)
+    )
+
+
+def _raise_unless_supported_join_key(on: str, arrow_type: pa.DataType) -> None:
+    if _is_supported_join_key_type(arrow_type):
+        return
     raise TypeError(
-        f"Unsupported join key type {type(value).__name__!r}; "
-        "merge_into currently supports string, integer, and float keys."
+        f"Join key column {on!r} has unsupported type {arrow_type}; "
+        f"merge_into supports {_JOIN_KEY_TYPE_HELP} keys."
+    )
+
+
+def _sql_string_literal(value: Any) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_date_literal(value: Any) -> str:
+    if isinstance(value, datetime.datetime):
+        value = value.date()
+    if not isinstance(value, datetime.date):
+        value = pa.scalar(value, type=pa.date32()).as_py()
+    return f"DATE '{value.isoformat()}'"
+
+
+def _sql_timestamp_literal(value: Any, arrow_type: pa.DataType) -> str:
+    if not isinstance(value, datetime.datetime):
+        value = pa.scalar(value, type=arrow_type).as_py()
+    if not isinstance(value, datetime.datetime):
+        raise TypeError(
+            f"Unsupported timestamp join key value {type(value).__name__!r}"
+        )
+    timespec = "microseconds" if value.microsecond else "seconds"
+    rendered = value.isoformat(sep=" ", timespec=timespec)
+    return f"TIMESTAMP '{rendered}'"
+
+
+def _sql_time_literal(value: Any, arrow_type: pa.DataType) -> str:
+    if not isinstance(value, datetime.time):
+        value = pa.scalar(value, type=arrow_type).as_py()
+    if not isinstance(value, datetime.time):
+        raise TypeError(f"Unsupported time join key value {type(value).__name__!r}")
+    rendered = value.isoformat()
+    return f"TIME '{rendered}'"
+
+
+def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
+    precision = int(arrow_type.precision)
+    scale = int(arrow_type.scale)
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
+    quantized = value.quantize(Decimal(1).scaleb(-scale))
+    return f"DECIMAL({precision},{scale}) '{quantized}'"
+
+
+def _sql_binary_literal(value: Any) -> str:
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+    else:
+        raw = bytes(value)
+    return "X'" + raw.hex() + "'"
+
+
+def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
+    """Render a join-key value as a Lance SQL literal for ``IN (...)``."""
+    if arrow_type is None:
+        if isinstance(value, bool):
+            arrow_type = pa.bool_()
+        elif isinstance(value, int):
+            arrow_type = pa.int64()
+        elif isinstance(value, float):
+            arrow_type = pa.float64()
+        elif isinstance(value, str):
+            arrow_type = pa.string()
+        elif isinstance(value, datetime.datetime):
+            arrow_type = pa.timestamp("us")
+        elif isinstance(value, datetime.date):
+            arrow_type = pa.date32()
+        elif isinstance(value, datetime.time):
+            arrow_type = pa.time64("us")
+        elif isinstance(value, Decimal):
+            arrow_type = pa.decimal128(38, max(-value.as_tuple().exponent, 0))
+        elif isinstance(value, bytes | bytearray | memoryview):
+            arrow_type = pa.binary()
+        else:
+            raise TypeError(
+                f"Unsupported join key type {type(value).__name__!r}; "
+                f"merge_into supports {_JOIN_KEY_TYPE_HELP} keys."
+            )
+    arrow_type = _unwrap_dictionary_type(arrow_type)
+    if pa.types.is_boolean(arrow_type):
+        return "TRUE" if value else "FALSE"
+    if pa.types.is_integer(arrow_type):
+        return str(int(value))
+    if pa.types.is_floating(arrow_type):
+        return repr(float(value))
+    if _is_string_type(arrow_type):
+        return _sql_string_literal(value)
+    if pa.types.is_date(arrow_type):
+        return _sql_date_literal(value)
+    if pa.types.is_timestamp(arrow_type):
+        return _sql_timestamp_literal(value, arrow_type)
+    if pa.types.is_time(arrow_type):
+        return _sql_time_literal(value, arrow_type)
+    if pa.types.is_decimal(arrow_type):
+        return _sql_decimal_literal(value, arrow_type)
+    if _is_binary_type(arrow_type):
+        return _sql_binary_literal(value)
+    raise TypeError(
+        f"Unsupported join key type {arrow_type}; "
+        f"merge_into supports {_JOIN_KEY_TYPE_HELP} keys."
     )
 
 
@@ -301,8 +443,9 @@ def _plan_task(
         matches_of: dict[Any, list[tuple[int, int, int]]] = collections.defaultdict(
             list
         )
+        key_type = target_schema.field(on).type
         for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
-            in_list = ", ".join(_sql_literal(key) for key in batch)
+            in_list = ", ".join(_sql_literal(key, key_type) for key in batch)
             # Backticks are Lance's identifier quoting (double quotes would be
             # parsed as a string literal by the filter planner).
             hits = dataset.to_table(
@@ -819,10 +962,14 @@ def merge_into(
             unspecified).
         uri: The URI of the target Lance dataset. Either ``uri`` OR
             (``namespace_impl`` + ``table_id``) must be provided.
-        on: The join key column name. A scalar index on this column is
-            strongly recommended for large targets (the plan phase falls
-            back to filtered scans without one). Every target row whose
-            key matches a source row is updated (join-all).
+        on: The join key column name. Supported types are boolean, integer,
+            floating, string, date, timestamp, time, decimal, and binary
+            (dictionary-encoded scalars unwrap to the value type). Nested
+            types are rejected on the driver before any Ray task starts. A
+            scalar index on this column is strongly recommended for large
+            targets (the plan phase falls back to filtered scans without
+            one). Every target row whose key matches a source row is
+            updated (join-all).
         table_id: The table identifier as a list of strings. Must be provided
             together with ``namespace_impl``.
         namespace_impl: The namespace implementation type (e.g. ``"rest"``,
@@ -890,6 +1037,7 @@ def merge_into(
         raise ValueError(
             f"Join key column {on!r} not found in target schema {target_schema.names}"
         )
+    _raise_unless_supported_join_key(on, target_schema.field(on).type)
     if not _has_scalar_index_on(dataset, on):
         logger.warning(
             "No scalar index found on join key column %r; the merge_into plan "

@@ -4,7 +4,9 @@
 """Test cases for lance_ray.merge_into (distributed merge_into)."""
 
 import collections
+import datetime
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -116,6 +118,37 @@ def test_pack_plan_buckets_omits_empty_owners():
     assert matched.num_rows == 1
     assert matched.column(_OFFSET_COLUMN).to_pylist() == [3]
     assert matched.column(_ROWID_COLUMN).to_pylist() == [99]
+
+
+def test_sql_literal_renders_common_scalars():
+    from lance_ray.merge_into import _sql_literal
+
+    assert _sql_literal(True) == "TRUE"
+    assert _sql_literal(False, pa.bool_()) == "FALSE"
+    assert _sql_literal(7, pa.int64()) == "7"
+    assert _sql_literal("O'Brien") == "'O''Brien'"
+    assert _sql_literal(datetime.date(2024, 1, 15), pa.date32()) == "DATE '2024-01-15'"
+    assert (
+        _sql_literal(
+            datetime.datetime(2024, 1, 15, 12, 30, 0),
+            pa.timestamp("us"),
+        )
+        == "TIMESTAMP '2024-01-15 12:30:00'"
+    )
+    assert (
+        _sql_literal(Decimal("12.000"), pa.decimal128(5, 3))
+        == "DECIMAL(5,3) '12.000'"
+    )
+    assert _sql_literal(b"abc", pa.binary()) == "X'616263'"
+
+
+def test_nested_join_key_type_is_rejected():
+    from lance_ray.merge_into import _raise_unless_supported_join_key
+
+    _raise_unless_supported_join_key("id", pa.int64())
+    _raise_unless_supported_join_key("k", pa.dictionary(pa.int32(), pa.string()))
+    with pytest.raises(TypeError, match="unsupported type"):
+        _raise_unless_supported_join_key("tags", pa.list_(pa.int32()))
 
 
 class TestMergeInto:
@@ -417,6 +450,101 @@ class TestMergeInto:
         assert values["be'ta"] == "updated"
         assert values["delta"] == "inserted"
 
+    def test_date_join_keys(self, temp_dir):
+        """Date keys are planned as DATE literals, not remote TypeErrors."""
+        path = Path(temp_dir) / "date_keys"
+        target = pa.table(
+            {
+                "event_date": pa.array(
+                    [
+                        datetime.date(2024, 1, 1),
+                        datetime.date(2024, 1, 2),
+                        datetime.date(2024, 1, 3),
+                    ],
+                    type=pa.date32(),
+                ),
+                "value": ["a", "b", "c"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "event_date": pa.array(
+                    [datetime.date(2024, 1, 2), datetime.date(2024, 1, 4)],
+                    type=pa.date32(),
+                ),
+                "value": ["B", "D"],
+            }
+        )
+        updated = lr.merge_into(source, str(path), on="event_date", num_workers=2)
+        pairs = list(
+            zip(
+                updated.to_table().column("event_date").to_pylist(),
+                updated.to_table().column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert (datetime.date(2024, 1, 1), "a") in pairs
+        assert (datetime.date(2024, 1, 2), "B") in pairs
+        assert (datetime.date(2024, 1, 3), "c") in pairs
+        assert (datetime.date(2024, 1, 4), "D") in pairs
+
+    def test_decimal_and_binary_join_keys(self, temp_dir):
+        path = Path(temp_dir) / "decimal_binary"
+        dec = pa.decimal128(5, 2)
+        target = pa.table(
+            {
+                "amount": pa.array(
+                    [Decimal("1.50"), Decimal("2.00")], type=dec
+                ),
+                "payload": pa.array([b"aa", b"bb"], type=pa.binary()),
+                "value": ["keep", "old"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "amount": pa.array([Decimal("2.00"), Decimal("3.25")], type=dec),
+                "payload": pa.array([b"bb", b"cc"], type=pa.binary()),
+                "value": ["new_2", "new_3"],
+            }
+        )
+        by_amount = lr.merge_into(
+            source.select(["amount", "payload", "value"]),
+            str(path),
+            on="amount",
+            num_workers=1,
+        )
+        amounts = dict(
+            zip(
+                by_amount.to_table().column("amount").to_pylist(),
+                by_amount.to_table().column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert amounts[Decimal("1.50")] == "keep"
+        assert amounts[Decimal("2.00")] == "new_2"
+        assert amounts[Decimal("3.25")] == "new_3"
+
+        path_bin = Path(temp_dir) / "binary_keys"
+        lr.write_lance(ray.data.from_arrow(target), str(path_bin))
+        by_payload = lr.merge_into(
+            source.select(["amount", "payload", "value"]),
+            str(path_bin),
+            on="payload",
+            num_workers=1,
+        )
+        payloads = dict(
+            zip(
+                by_payload.to_table().column("payload").to_pylist(),
+                by_payload.to_table().column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert payloads[b"aa"] == "keep"
+        assert payloads[b"bb"] == "new_2"
+        assert payloads[b"cc"] == "new_3"
+
     def test_merge_into_with_directory_namespace(self, temp_dir):
         """Namespace-resolved tables work end to end."""
         import lance_namespace as ln
@@ -713,6 +841,25 @@ class TestMergeIntoValidation:
         source = pa.table({"id": [1], "value": ["x"]})
         with pytest.raises(ValueError, match="not found in target schema"):
             lr.merge_into(source, str(path), on="missing_column")
+
+    def test_rejects_nested_join_key_on_driver(self, temp_dir):
+        """Nested join keys fail from the target schema, before plan tasks."""
+        path = Path(temp_dir) / "nested_key"
+        target = pa.table(
+            {
+                "tags": pa.array([[1], [2]], type=pa.list_(pa.int32())),
+                "value": ["a", "b"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "tags": pa.array([[1], [3]], type=pa.list_(pa.int32())),
+                "value": ["A", "C"],
+            }
+        )
+        with pytest.raises(TypeError, match="unsupported type"):
+            lr.merge_into(source, str(path), on="tags", num_workers=1)
 
     def test_rejects_missing_source_columns(self, temp_dir):
         path = Path(temp_dir) / "missing_columns"

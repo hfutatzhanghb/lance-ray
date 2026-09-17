@@ -34,7 +34,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 
 - `ds`: The source rows, as a `ray.data.Dataset` or a `pyarrow.Table`. The source must contain every column of the target schema (columns are reordered/cast as needed) and must not contain null join keys. Duplicate join keys are deduplicated, keeping one arbitrary occurrence per key (which copy survives is unspecified).
 - `uri`: Target dataset URI (either `uri` OR `namespace_impl` + `table_id` required)
-- `on`: Join key column name (required, keyword-only). A scalar index on this column is strongly recommended for large targets (the plan phase falls back to filtered scans without one). Every matching target row is updated (join-all, same as pylance `merge_insert`).
+- `on`: Join key column name (required, keyword-only). Supported scalar types: boolean, integer, floating, string, date, timestamp, time, decimal, and binary (including dictionary-encoded scalars). Nested types such as list or struct are rejected on the driver before any Ray task starts. A scalar index on this column is strongly recommended for large targets (the plan phase falls back to filtered scans without one). Every matching target row is updated (join-all, same as pylance `merge_insert`).
 - `table_id`: Table identifier as a list of strings (requires `namespace_impl`)
 - `namespace_impl`: Namespace implementation type (e.g., `"rest"`, `"dir"`)
 - `namespace_properties`: Properties for connecting to the namespace
@@ -49,6 +49,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 - Raise **`num_partitions` above `num_workers`** when plan tasks are memory-heavy (large source chunks or expensive index probes). Example: `num_workers=8`, `num_partitions=32` runs 32 smaller plan tasks with at most 8 in flight, and still only 8 apply owners. Plan tasks yield only non-empty owner buckets, so empty plan→apply edges are not stored as Ray objects.
 - Do **not** set `num_partitions` in the hundreds or thousands expecting more apply workers. Apply fan-out follows `num_workers`. A large `num_partitions` only increases how many plan tasks run.
 - Create a scalar index (e.g. BTREE) on the join key before merging into large tables so planning is index lookups instead of filtered scans.
+- Join on a scalar column. Dates, timestamps, decimals, and binary keys are encoded as Lance SQL literals in the plan phase. List, struct, and other nested types fail immediately from the target schema — they do not wait for a remote plan task.
 
 ## Examples
 
@@ -88,3 +89,4 @@ dataset = lr.merge_into(
 - Concurrent writes: appends that land during the merge_into are rebased inside `LanceDataset.commit`. If a concurrent commit rewrites, removes, or updates-in-place (new deletion file / fragment metadata) one of the fragments this merge_into touches (e.g. compaction or another merge-on-read update), the operation fails rather than silently dropping the concurrent change. If `commit` raises after this merge's fragments are already visible (lost success ack), the call returns the latest dataset instead of failing, so a job-level retry cannot double-insert.
 - Concurrent inserts of the same key: Lance's conflict detection is fragment-level, so two concurrent `merge_into` calls inserting the same *new* join key are physically disjoint — both commits succeed and the key is duplicated. Serialize `merge_into` against the same table externally (e.g. one scheduled writer). Key-level conflict detection is discussed as future work in the [design doc](merge-insert-design.md#112-key-level-conflict-detection-isolation-parity-with-native-merge_insert).
 - Create a scalar index (e.g. BTREE) on the join key column before calling `merge_into` on large tables — key-to-fragment planning is served by the index instead of scanning the table. See [Best practices](#best-practices).
+- Join key types: boolean, integer, floating, string, date, timestamp, time, decimal, and binary. Nested types are rejected on the driver.
