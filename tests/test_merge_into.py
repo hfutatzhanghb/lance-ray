@@ -108,7 +108,9 @@ def test_pack_plan_buckets_omits_empty_owners():
     updates[2][5].append((0, 99, 3))
     inserts: list[list[int]] = [[] for _ in range(4)]
     inserts[1] = [1]
-    owners, buckets, bucket_rows = _pack_plan_buckets(4, chunk, updates, inserts)
+    owners, buckets, bucket_rows = _pack_plan_buckets(
+        4, chunk, updates, inserts, _ROWID_COLUMN, _OFFSET_COLUMN
+    )
     assert owners == [1, 2]
     assert bucket_rows == [0, 1, 1, 0]
     assert buckets[0]["frags"] == {}
@@ -118,6 +120,42 @@ def test_pack_plan_buckets_omits_empty_owners():
     assert matched.num_rows == 1
     assert matched.column(_OFFSET_COLUMN).to_pylist() == [3]
     assert matched.column(_ROWID_COLUMN).to_pylist() == [99]
+
+
+def test_helper_column_names_share_taken_set():
+    from lance_ray.merge_into import (
+        _OFFSET_COLUMN,
+        _ROWID_COLUMN,
+        _helper_column_names,
+    )
+
+    assert _helper_column_names(pa.schema([("id", pa.int64())])) == (
+        _ROWID_COLUMN,
+        _OFFSET_COLUMN,
+    )
+    taken_defaults = pa.schema(
+        [
+            (_ROWID_COLUMN, pa.int64()),
+            (_OFFSET_COLUMN, pa.int64()),
+        ]
+    )
+    assert _helper_column_names(taken_defaults) == (
+        f"{_ROWID_COLUMN}_2",
+        f"{_OFFSET_COLUMN}_2",
+    )
+    taken_through_2 = pa.schema(
+        [
+            ("id", pa.int64()),
+            (_ROWID_COLUMN, pa.int64()),
+            (_OFFSET_COLUMN, pa.int64()),
+            (f"{_ROWID_COLUMN}_2", pa.int64()),
+            (f"{_OFFSET_COLUMN}_2", pa.int64()),
+        ]
+    )
+    assert _helper_column_names(taken_through_2) == (
+        f"{_ROWID_COLUMN}_3",
+        f"{_OFFSET_COLUMN}_3",
+    )
 
 
 def test_sql_literal_renders_common_scalars():
@@ -449,6 +487,117 @@ class TestMergeInto:
         )
         assert values["be'ta"] == "updated"
         assert values["delta"] == "inserted"
+
+    def test_insert_when_helper_name_is_user_column(self, temp_dir):
+        """Inserts drop the computed helper, not a colliding user field."""
+        path = Path(temp_dir) / "helper_insert"
+        target = pa.table(
+            {
+                "id": [1, 2],
+                "__merge_into_rowid": [10, 20],
+                "value": ["a", "b"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "id": [3],
+                "__merge_into_rowid": [30],
+                "value": ["c"],
+            }
+        )
+        updated = lr.merge_into(source, str(path), on="id", num_workers=1)
+        values = id_to_value(updated)
+        assert values == {1: "a", 2: "b", 3: "c"}
+        rowids = dict(
+            zip(
+                updated.to_table().column("id").to_pylist(),
+                updated.to_table().column("__merge_into_rowid").to_pylist(),
+                strict=True,
+            )
+        )
+        assert rowids == {1: 10, 2: 20, 3: 30}
+
+    def test_update_when_helper_names_are_user_columns(self, temp_dir):
+        """Matched rows keep user fields that reuse the default helper names."""
+        path = Path(temp_dir) / "helper_update"
+        target = pa.table(
+            {
+                "id": [1, 2],
+                "__merge_into_rowid": [10, 20],
+                "__merge_into_offset": [100, 200],
+                "value": ["a", "b"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "id": [1],
+                "__merge_into_rowid": [11],
+                "__merge_into_offset": [101],
+                "value": ["A"],
+            }
+        )
+        updated = lr.merge_into(source, str(path), on="id", num_workers=1)
+        table = updated.to_table()
+        by_id = {
+            key: (value, rowid, offset)
+            for key, value, rowid, offset in zip(
+                table.column("id").to_pylist(),
+                table.column("value").to_pylist(),
+                table.column("__merge_into_rowid").to_pylist(),
+                table.column("__merge_into_offset").to_pylist(),
+                strict=True,
+            )
+        }
+        assert by_id[1] == ("A", 11, 101)
+        assert by_id[2] == ("b", 20, 200)
+
+    def test_helpers_skip_default_and_suffix_2_user_columns(self, temp_dir):
+        """Default helper names and their _2 suffixes can all be user fields."""
+        path = Path(temp_dir) / "helper_suffix_3"
+        target = pa.table(
+            {
+                "id": [1],
+                "__merge_into_rowid": [10],
+                "__merge_into_offset": [100],
+                "__merge_into_rowid_2": [12],
+                "__merge_into_offset_2": [102],
+                "value": ["old"],
+            }
+        )
+        lr.write_lance(ray.data.from_arrow(target), str(path))
+        source = pa.table(
+            {
+                "id": [1, 2],
+                "__merge_into_rowid": [11, 21],
+                "__merge_into_offset": [101, 201],
+                "__merge_into_rowid_2": [13, 23],
+                "__merge_into_offset_2": [103, 203],
+                "value": ["new", "ins"],
+            }
+        )
+        updated = lr.merge_into(source, str(path), on="id", num_workers=1)
+        table = updated.to_table()
+        by_id = {
+            key: (
+                value,
+                table.column("__merge_into_rowid").to_pylist()[i],
+                table.column("__merge_into_offset").to_pylist()[i],
+                table.column("__merge_into_rowid_2").to_pylist()[i],
+                table.column("__merge_into_offset_2").to_pylist()[i],
+            )
+            for i, (key, value) in enumerate(
+                zip(
+                    table.column("id").to_pylist(),
+                    table.column("value").to_pylist(),
+                    strict=True,
+                )
+            )
+        }
+        assert by_id[1] == ("new", 11, 101, 13, 103)
+        assert by_id[2] == ("ins", 21, 201, 23, 203)
+        assert updated.count_rows() == 2
 
     def test_date_join_keys(self, temp_dir):
         """Date keys are planned as DATE literals, not remote TypeErrors."""

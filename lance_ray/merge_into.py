@@ -84,12 +84,38 @@ logger = logging.getLogger(__name__)
 # Number of join keys per ``IN (...)`` index lookup in the plan phase.
 _LOOKUP_BATCH_SIZE = 10_000
 
-# Helper columns shipped inside the plan buckets for matched target rows.
+# Preferred helper column names shipped inside the plan buckets. If the
+# target schema already uses a name, ``_helper_column_names`` picks the
+# next free ``_2`` / ``_3`` / ... suffix from a shared taken set.
 # ``_rowaddr``'s low 32 bits are the local physical offsets
-# ``LanceFragment.delete_rows`` consumes (valid on both dataset flavors).
-# Logical ``_rowid`` is kept so stable-row-id replacements can reuse it.
+# ``LanceFragment.delete_rows`` consumes. Logical ``_rowid`` is kept so
+# stable-row-id replacements can reuse it.
 _ROWID_COLUMN = "__merge_into_rowid"
 _OFFSET_COLUMN = "__merge_into_offset"
+
+
+def _unused_column_name(preferred: str, taken: set[str]) -> str:
+    if preferred not in taken:
+        return preferred
+    suffix = 2
+    while True:
+        candidate = f"{preferred}_{suffix}"
+        if candidate not in taken:
+            return candidate
+        suffix += 1
+
+
+def _helper_column_names(schema: pa.Schema) -> tuple[str, str]:
+    """Pick rowid/offset helper names that do not collide with ``schema``.
+
+    Both names are reserved from the same ``taken`` set, in order, so they
+    cannot collide with user fields or with each other.
+    """
+    taken = set(schema.names)
+    rowid_column = _unused_column_name(_ROWID_COLUMN, taken)
+    taken.add(rowid_column)
+    offset_column = _unused_column_name(_OFFSET_COLUMN, taken)
+    return rowid_column, offset_column
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +313,21 @@ def _raise_on_duplicate_rowids(row_ids: list[int], context: str) -> None:
         )
 
 
-def _with_rowid_column(table: pa.Table, row_ids: list[int]) -> pa.Table:
-    return table.append_column(_ROWID_COLUMN, pa.array(row_ids, type=pa.int64()))
+def _with_rowid_column(
+    table: pa.Table, row_ids: list[int], rowid_column: str
+) -> pa.Table:
+    return table.append_column(rowid_column, pa.array(row_ids, type=pa.int64()))
 
 
 def _with_match_identity(
-    table: pa.Table, row_ids: list[int], offsets: list[int]
+    table: pa.Table,
+    row_ids: list[int],
+    offsets: list[int],
+    rowid_column: str,
+    offset_column: str,
 ) -> pa.Table:
-    return _with_rowid_column(table, row_ids).append_column(
-        _OFFSET_COLUMN, pa.array(offsets, type=pa.int64())
+    return _with_rowid_column(table, row_ids, rowid_column).append_column(
+        offset_column, pa.array(offsets, type=pa.int64())
     )
 
 
@@ -310,6 +342,8 @@ def _pack_plan_buckets(
     source_chunk: pa.Table,
     updates_by_owner: list[dict[int, list[tuple[int, int, int]]]],
     inserts_by_owner: list[list[int]],
+    rowid_column: str,
+    offset_column: str,
 ) -> tuple[list[int], list[dict[str, Any]], list[int]]:
     """Build apply-owner payloads, omitting owners with no rows.
 
@@ -327,13 +361,17 @@ def _pack_plan_buckets(
             row_ids = [rowid for _, rowid, _ in pairs]
             offsets = [offset for _, _, offset in pairs]
             frags[fragment_id] = _with_match_identity(
-                source_chunk.take(indices), row_ids, offsets
+                source_chunk.take(indices),
+                row_ids,
+                offsets,
+                rowid_column,
+                offset_column,
             )
         inserts = None
         if inserts_by_owner[owner]:
             insert_table = source_chunk.take(inserts_by_owner[owner])
             inserts = _with_rowid_column(
-                insert_table, [-1] * insert_table.num_rows
+                insert_table, [-1] * insert_table.num_rows, rowid_column
             )
         rows = sum(t.num_rows for t in frags.values()) + (
             inserts.num_rows if inserts is not None else 0
@@ -485,8 +523,14 @@ def _plan_task(
                     fragment_id
                 ].append((i, rowid, offset))
 
+        rowid_column, offset_column = _helper_column_names(target_schema)
         owners, buckets, bucket_rows = _pack_plan_buckets(
-            n_apply, source_chunk, updates_by_owner, inserts_by_owner
+            n_apply,
+            source_chunk,
+            updates_by_owner,
+            inserts_by_owner,
+            rowid_column,
+            offset_column,
         )
         for bucket in buckets:
             yield bucket
@@ -536,16 +580,6 @@ def _apply_task(
     """
     t0 = time.perf_counter()
     payloads = ray.get(bucket_refs)
-    tables_by_fragment: dict[int, list[pa.Table]] = collections.defaultdict(list)
-    insert_parts: list[pa.Table] = []
-    for payload in payloads:
-        for fragment_id, table in payload["frags"].items():
-            tables_by_fragment[fragment_id].append(table)
-        if payload["inserts"] is not None and payload["inserts"].num_rows:
-            # Insert rows carry no useful rowid (-1); strip the helper
-            # column so the appended rows match the target schema.
-            insert_parts.append(payload["inserts"].drop_columns([_ROWID_COLUMN]))
-
     namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
     )
@@ -558,7 +592,18 @@ def _apply_task(
         storage_options=storage_options or None,
         **namespace_kwargs,
     )
+    rowid_column, offset_column = _helper_column_names(dataset.schema)
     fragment_by_id = {f.fragment_id: f for f in dataset.get_fragments()}
+
+    tables_by_fragment: dict[int, list[pa.Table]] = collections.defaultdict(list)
+    insert_parts: list[pa.Table] = []
+    for payload in payloads:
+        for fragment_id, table in payload["frags"].items():
+            tables_by_fragment[fragment_id].append(table)
+        if payload["inserts"] is not None and payload["inserts"].num_rows:
+            # Insert rows carry no useful rowid (-1); strip the helper
+            # column so the appended rows match the target schema.
+            insert_parts.append(payload["inserts"].drop_columns([rowid_column]))
 
     removed_fragment_ids: list[int] = []
     updated_fragments: list[bytes] = []
@@ -572,13 +617,13 @@ def _apply_task(
         # force the delete to rescan and decode the fragment's key column.
         # Join-all may place the same source key on this fragment more than
         # once (one copy per matching target row).
-        row_ids = source_rows.column(_ROWID_COLUMN).to_pylist()
-        offsets = source_rows.column(_OFFSET_COLUMN).to_pylist()
+        row_ids = source_rows.column(rowid_column).to_pylist()
+        offsets = source_rows.column(offset_column).to_pylist()
         _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
         _raise_on_duplicate_rowids(
             offsets, f"target fragment {fragment_id} offsets"
         )
-        source_rows = source_rows.drop_columns([_ROWID_COLUMN, _OFFSET_COLUMN])
+        source_rows = source_rows.drop_columns([rowid_column, offset_column])
         new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)

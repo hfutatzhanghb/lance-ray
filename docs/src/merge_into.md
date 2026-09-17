@@ -50,6 +50,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 - Do **not** set `num_partitions` in the hundreds or thousands expecting more apply workers. Apply fan-out follows `num_workers`. A large `num_partitions` only increases how many plan tasks run.
 - Create a scalar index (e.g. BTREE) on the join key before merging into large tables so planning is index lookups instead of filtered scans.
 - Join on a scalar column. Dates, timestamps, decimals, and binary keys are encoded as Lance SQL literals in the plan phase. List, struct, and other nested types fail immediately from the target schema — they do not wait for a remote plan task.
+- Plan/apply may attach temporary helper columns (default `__merge_into_rowid` and `__merge_into_offset`). If those names already exist on the target, the next free `_2` / `_3` / ... suffix is chosen so user columns are never overwritten.
 
 ## Examples
 
@@ -90,3 +91,4 @@ dataset = lr.merge_into(
 - Concurrent inserts of the same key: Lance's conflict detection is fragment-level, so two concurrent `merge_into` calls inserting the same *new* join key are physically disjoint — both commits succeed and the key is duplicated. Serialize `merge_into` against the same table externally (e.g. one scheduled writer). Key-level conflict detection is discussed as future work in the [design doc](merge-insert-design.md#112-key-level-conflict-detection-isolation-parity-with-native-merge_insert).
 - Create a scalar index (e.g. BTREE) on the join key column before calling `merge_into` on large tables — key-to-fragment planning is served by the index instead of scanning the table. See [Best practices](#best-practices).
 - Join key types: boolean, integer, floating, string, date, timestamp, time, decimal, and binary. Nested types are rejected on the driver.
+- Internal helper column names are allocated from the target schema so they cannot collide with user fields.
