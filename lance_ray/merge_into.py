@@ -55,6 +55,7 @@ Example:
 
 import collections
 import datetime
+import json
 import logging
 import pickle
 import time
@@ -124,8 +125,7 @@ def _helper_column_names(schema: pa.Schema) -> tuple[str, str]:
 
 
 _JOIN_KEY_TYPE_HELP = (
-    "boolean, integer, floating, string, date, timestamp, time, decimal, "
-    "or binary"
+    "boolean, integer, floating, string, date, timestamp, time, decimal, or binary"
 )
 
 
@@ -188,25 +188,40 @@ def _sql_date_literal(value: Any) -> str:
     return f"DATE '{value.isoformat()}'"
 
 
-def _sql_timestamp_literal(value: Any, arrow_type: pa.DataType) -> str:
-    if not isinstance(value, datetime.datetime):
-        value = pa.scalar(value, type=arrow_type).as_py()
-    if not isinstance(value, datetime.datetime):
-        raise TypeError(
-            f"Unsupported timestamp join key value {type(value).__name__!r}"
-        )
-    timespec = "microseconds" if value.microsecond else "seconds"
-    rendered = value.isoformat(sep=" ", timespec=timespec)
-    return f"TIMESTAMP '{rendered}'"
+def _sql_temporal_literal(value: Any, arrow_type: pa.DataType) -> str:
+    """Cast integer ticks to an exact temporal scalar, including its timezone.
+
+    Python ``time`` loses nanoseconds, bare SQL TIMESTAMP uses microseconds,
+    and Lance does not support SQL TIME literals. ``arrow_cast`` retains the
+    Arrow unit/timezone and is constant-folded for scalar index lookups.
+    """
+    unit = {
+        "s": "Second",
+        "ms": "Millisecond",
+        "us": "Microsecond",
+        "ns": "Nanosecond",
+    }[arrow_type.unit]
+    scalar = pa.scalar(value, type=arrow_type)
+    if pa.types.is_time32(arrow_type):
+        ticks = f"CAST({scalar.cast(pa.int32()).as_py()} AS INT)"
+        type_name = f"Time32({unit})"
+    else:
+        ticks = str(scalar.cast(pa.int64()).as_py())
+        if pa.types.is_timestamp(arrow_type):
+            timezone = f"Some({json.dumps(arrow_type.tz)})" if arrow_type.tz else "None"
+            type_name = f"Timestamp({unit}, {timezone})"
+        else:
+            type_name = f"Time64({unit})"
+    return f"arrow_cast({ticks}, {_sql_string_literal(type_name)})"
 
 
-def _sql_time_literal(value: Any, arrow_type: pa.DataType) -> str:
-    if not isinstance(value, datetime.time):
-        value = pa.scalar(value, type=arrow_type).as_py()
-    if not isinstance(value, datetime.time):
-        raise TypeError(f"Unsupported time join key value {type(value).__name__!r}")
-    rendered = value.isoformat()
-    return f"TIME '{rendered}'"
+def _join_key_values(column: pa.ChunkedArray) -> list[Any]:
+    """Keep temporal keys as integer ticks on both sides of the lookup."""
+    arrow_type = _unwrap_dictionary_type(column.type)
+    if pa.types.is_timestamp(arrow_type) or pa.types.is_time(arrow_type):
+        integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
+        return column.cast(arrow_type).cast(integer_type).to_pylist()
+    return column.to_pylist()
 
 
 def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
@@ -263,10 +278,8 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
         return _sql_string_literal(value)
     if pa.types.is_date(arrow_type):
         return _sql_date_literal(value)
-    if pa.types.is_timestamp(arrow_type):
-        return _sql_timestamp_literal(value, arrow_type)
-    if pa.types.is_time(arrow_type):
-        return _sql_time_literal(value, arrow_type)
+    if pa.types.is_timestamp(arrow_type) or pa.types.is_time(arrow_type):
+        return _sql_temporal_literal(value, arrow_type)
     if pa.types.is_decimal(arrow_type):
         return _sql_decimal_literal(value, arrow_type)
     if _is_binary_type(arrow_type):
@@ -464,7 +477,7 @@ def _plan_task(
             namespace_impl, namespace_properties, table_id
         )
         source_chunk = _align_chunk(source_chunk, target_schema, on)
-        keys = source_chunk.column(on).to_pylist()
+        keys = _join_key_values(source_chunk.column(on))
         _raise_on_duplicate_keys(keys, on, f"plan task {task_id}")
 
         dataset = lance.LanceDataset(
@@ -493,7 +506,7 @@ def _plan_task(
                 with_row_id=True,
             )
             for key, rowaddr, rowid in zip(
-                hits.column(on).to_pylist(),
+                _join_key_values(hits.column(on)),
                 hits.column("_rowaddr").to_pylist(),
                 hits.column("_rowid").to_pylist(),
                 strict=False,
@@ -519,9 +532,9 @@ def _plan_task(
             num_matched += len(hits)
             for fragment_id, rowid, offset in hits:
                 touched_fragments.add(fragment_id)
-                updates_by_owner[_key_bucket(fragment_id, n_apply)][
-                    fragment_id
-                ].append((i, rowid, offset))
+                updates_by_owner[_key_bucket(fragment_id, n_apply)][fragment_id].append(
+                    (i, rowid, offset)
+                )
 
         rowid_column, offset_column = _helper_column_names(target_schema)
         owners, buckets, bucket_rows = _pack_plan_buckets(
@@ -620,9 +633,7 @@ def _apply_task(
         row_ids = source_rows.column(rowid_column).to_pylist()
         offsets = source_rows.column(offset_column).to_pylist()
         _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
-        _raise_on_duplicate_rowids(
-            offsets, f"target fragment {fragment_id} offsets"
-        )
+        _raise_on_duplicate_rowids(offsets, f"target fragment {fragment_id} offsets")
         source_rows = source_rows.drop_columns([rowid_column, offset_column])
         new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
         if new_meta is None:
@@ -1134,9 +1145,7 @@ def merge_into(
     # the driver; the apply task fetches them node-to-node itself.
     refs_by_owner: dict[int, list] = collections.defaultdict(list)
     for meta in plan_results:
-        for owner, ref in zip(
-            meta["bucket_owners"], meta["bucket_refs"], strict=True
-        ):
+        for owner, ref in zip(meta["bucket_owners"], meta["bucket_refs"], strict=True):
             refs_by_owner[owner].append(ref)
     apply_args = [
         (

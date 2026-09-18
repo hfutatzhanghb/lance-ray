@@ -171,13 +171,54 @@ def test_sql_literal_renders_common_scalars():
             datetime.datetime(2024, 1, 15, 12, 30, 0),
             pa.timestamp("us"),
         )
-        == "TIMESTAMP '2024-01-15 12:30:00'"
+        == "arrow_cast(1705321800000000, 'Timestamp(Microsecond, None)')"
     )
     assert (
-        _sql_literal(Decimal("12.000"), pa.decimal128(5, 3))
-        == "DECIMAL(5,3) '12.000'"
+        _sql_literal(Decimal("12.000"), pa.decimal128(5, 3)) == "DECIMAL(5,3) '12.000'"
     )
     assert _sql_literal(b"abc", pa.binary()) == "X'616263'"
+
+
+@pytest.mark.parametrize(
+    ("key_type", "ticks"),
+    [
+        (pa.timestamp("s"), -1),
+        (pa.timestamp("ms"), -1),
+        (pa.timestamp("us"), -1),
+        (pa.timestamp("ns"), -1),
+        (pa.timestamp("ns", tz="Asia/Shanghai"), -1),
+        (pa.time32("s"), 1),
+        (pa.time32("ms"), 1),
+        (pa.time64("us"), 1),
+        (pa.time64("ns"), 1),
+    ],
+)
+def test_temporal_key_literals_match_exactly(
+    tmp_path: Path, key_type: pa.DataType, ticks: int
+) -> None:
+    """Lance must resolve the literal to exactly one tick, also with an index."""
+    from lance_ray.merge_into import _join_key_values, _sql_literal
+
+    keys = pa.array([ticks, ticks + 1], type=key_type)
+    dataset = lance.write_dataset(pa.table({"key": keys}), str(tmp_path / "keys"))
+    assert _join_key_values(pa.chunked_array([keys])) == [ticks, ticks + 1]
+    assert _join_key_values(pa.chunked_array([keys.dictionary_encode()])) == [
+        ticks,
+        ticks + 1,
+    ]
+    predicate = f"key IN ({_sql_literal(keys[0], key_type)})"
+    assert (
+        dataset.to_table(filter=predicate)
+        .column("key")
+        .equals(pa.chunked_array([keys.slice(0, 1)]))
+    )
+    dataset.create_scalar_index("key", index_type="BTREE")
+    assert (
+        dataset.to_table(filter=predicate)
+        .column("key")
+        .equals(pa.chunked_array([keys.slice(0, 1)]))
+    )
+    assert "ScalarIndexQuery" in dataset.scanner(filter=predicate).explain_plan()
 
 
 def test_nested_join_key_type_is_rejected():
@@ -330,7 +371,9 @@ class TestMergeInto:
                 + ["new_500", "new_501", "new_502"],
             }
         )
-        updated = lr.merge_into(source, str(path), on="id", num_workers=2, num_partitions=6)
+        updated = lr.merge_into(
+            source, str(path), on="id", num_workers=2, num_partitions=6
+        )
 
         dataset = updated
         assert dataset.count_rows() == 23
@@ -638,14 +681,104 @@ class TestMergeInto:
         assert (datetime.date(2024, 1, 3), "c") in pairs
         assert (datetime.date(2024, 1, 4), "D") in pairs
 
+    @pytest.mark.parametrize("timezone", [None, "Asia/Shanghai"])
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_nanosecond_timestamp_join_keys(
+        self, tmp_path: Path, timezone: str | None, with_index: bool
+    ) -> None:
+        """Submicrosecond keys, including before the epoch, update exactly."""
+        path = str(tmp_path / "timestamp_keys")
+        key_type = pa.timestamp("ns", tz=timezone)
+        target = pa.table(
+            {
+                "key": pa.array([-1001, -1, 0, 1, 1700000000000000001], type=key_type),
+                "value": [
+                    "keep_negative",
+                    "old_negative",
+                    "keep_zero",
+                    "old",
+                    "old_recent",
+                ],
+            }
+        )
+        dataset = lance.write_dataset(target, path, max_rows_per_file=2)
+        if with_index:
+            dataset.create_scalar_index("key", index_type="BTREE")
+        version_before = dataset.version
+        source = pa.table(
+            {
+                "key": pa.array(
+                    [-1, 1, 1700000000000000001, 1700000000000000002],
+                    type=key_type,
+                ),
+                "value": ["new_negative", "new", "new_recent", "inserted"],
+            }
+        )
+        updated = lr.merge_into(source, path, on="key", num_workers=2)
+        result = updated.to_table()
+        assert updated.version == version_before + 1
+        assert result.num_rows == 6
+        assert result.schema.field("key").type == key_type
+        assert dict(
+            zip(
+                result.column("key").cast(pa.int64()).to_pylist(),
+                result.column("value").to_pylist(),
+                strict=True,
+            )
+        ) == {
+            -1001: "keep_negative",
+            -1: "new_negative",
+            0: "keep_zero",
+            1: "new",
+            1700000000000000001: "new_recent",
+            1700000000000000002: "inserted",
+        }
+
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_nanosecond_time_join_keys(self, tmp_path: Path, with_index: bool) -> None:
+        """Distinct nanoseconds within one microsecond remain distinct keys."""
+        path = str(tmp_path / "time_keys")
+        key_type = pa.time64("ns")
+        target = pa.table(
+            {
+                "key": pa.array([0, 1, 2, 86399999999999], type=key_type),
+                "value": ["keep", "old_1", "old_2", "old_end_of_day"],
+            }
+        )
+        dataset = lance.write_dataset(target, path, max_rows_per_file=2)
+        if with_index:
+            dataset.create_scalar_index("key", index_type="BTREE")
+        version_before = dataset.version
+        source = pa.table(
+            {
+                "key": pa.array([1, 2, 3, 86399999999999], type=key_type),
+                "value": ["new_1", "new_2", "inserted", "new_end_of_day"],
+            }
+        )
+        updated = lr.merge_into(source, path, on="key", num_workers=2)
+        result = updated.to_table()
+        assert updated.version == version_before + 1
+        assert result.num_rows == 5
+        assert dict(
+            zip(
+                result.column("key").cast(pa.int64()).to_pylist(),
+                result.column("value").to_pylist(),
+                strict=True,
+            )
+        ) == {
+            0: "keep",
+            1: "new_1",
+            2: "new_2",
+            3: "inserted",
+            86399999999999: "new_end_of_day",
+        }
+
     def test_decimal_and_binary_join_keys(self, temp_dir):
         path = Path(temp_dir) / "decimal_binary"
         dec = pa.decimal128(5, 2)
         target = pa.table(
             {
-                "amount": pa.array(
-                    [Decimal("1.50"), Decimal("2.00")], type=dec
-                ),
+                "amount": pa.array([Decimal("1.50"), Decimal("2.00")], type=dec),
                 "payload": pa.array([b"aa", b"bb"], type=pa.binary()),
                 "value": ["keep", "old"],
             }
@@ -737,7 +870,9 @@ class TestMergeIntoDedupe:
                 "value": ["first_5", "dup_5", "first_100", "dup_100"],
             }
         )
-        updated = lr.merge_into(source, str(path), on="id", num_workers=1, num_partitions=1)
+        updated = lr.merge_into(
+            source, str(path), on="id", num_workers=1, num_partitions=1
+        )
 
         values = id_to_value(updated)
         assert values[5] in {"first_5", "dup_5"}
@@ -762,7 +897,9 @@ class TestMergeIntoDedupe:
             + ["dup_200", "dup_5"]
         )
         source = pa.table({"id": ids, "value": values})
-        updated = lr.merge_into(source, str(path), on="id", num_workers=2, num_partitions=4)
+        updated = lr.merge_into(
+            source, str(path), on="id", num_workers=2, num_partitions=4
+        )
 
         assert updated.version == version_before + 1
         dataset = updated
@@ -1034,4 +1171,6 @@ class TestMergeIntoValidation:
         with pytest.raises(ValueError, match="num_workers"):
             lr.merge_into(pa.table({"id": [1]}), "/tmp/x.lance", on="id", num_workers=0)
         with pytest.raises(ValueError, match="num_partitions"):
-            lr.merge_into(pa.table({"id": [1]}), "/tmp/x.lance", on="id", num_partitions=0)
+            lr.merge_into(
+                pa.table({"id": [1]}), "/tmp/x.lance", on="id", num_partitions=0
+            )

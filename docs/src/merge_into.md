@@ -49,7 +49,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 - Raise **`num_partitions` above `num_workers`** when plan tasks are memory-heavy (large source chunks or expensive index probes). Example: `num_workers=8`, `num_partitions=32` runs 32 smaller plan tasks with at most 8 in flight, and still only 8 apply owners. Plan tasks yield only non-empty owner buckets, so empty plan→apply edges are not stored as Ray objects.
 - Do **not** set `num_partitions` in the hundreds or thousands expecting more apply workers. Apply fan-out follows `num_workers`. A large `num_partitions` only increases how many plan tasks run.
 - Create a scalar index (e.g. BTREE) on the join key before merging into large tables so planning is index lookups instead of filtered scans.
-- Join on a scalar column. Dates, timestamps, decimals, and binary keys are encoded as Lance SQL literals in the plan phase. List, struct, and other nested types fail immediately from the target schema — they do not wait for a remote plan task.
+- Join on a scalar column. Dates, timestamps, times, decimals, and binary keys are encoded as Lance SQL literals in the plan phase. Timestamp and time keys retain their Arrow precision, including nanoseconds; timestamp keys also retain their timezone. List, struct, and other nested types fail immediately from the target schema — they do not wait for a remote plan task.
 - Plan/apply may attach temporary helper columns (default `__merge_into_rowid` and `__merge_into_offset`). If those names already exist on the target, the next free `_2` / `_3` / ... suffix is chosen so user columns are never overwritten.
 
 ## Examples
