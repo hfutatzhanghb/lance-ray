@@ -53,6 +53,8 @@ Example:
     5
 """
 
+from __future__ import annotations
+
 import collections
 import datetime
 import json
@@ -60,8 +62,10 @@ import logging
 import pickle
 import time
 import zlib
+from collections.abc import Callable, Iterator
 from decimal import Decimal
-from typing import Any, Optional
+from functools import partial
+from typing import Any, Optional, Protocol, TypeVar
 
 import lance
 import pyarrow as pa
@@ -93,6 +97,15 @@ _LOOKUP_BATCH_SIZE = 10_000
 # stable-row-id replacements can reuse it.
 _ROWID_COLUMN = "__merge_into_rowid"
 _OFFSET_COLUMN = "__merge_into_offset"
+_SORT_COLUMN = "__merge_into_sort_key"
+
+_T = TypeVar("_T")
+_NamespaceArgs = tuple[str | None, dict[str, str] | None, list[str] | None]
+
+
+class _RemoteTask(Protocol):
+    @property
+    def remote(self) -> Callable[..., ray.ObjectRef[Any] | ray.ObjectRefGenerator]: ...
 
 
 def _unused_column_name(preferred: str, taken: set[str]) -> str:
@@ -195,6 +208,8 @@ def _sql_temporal_literal(value: Any, arrow_type: pa.DataType) -> str:
     and Lance does not support SQL TIME literals. ``arrow_cast`` retains the
     Arrow unit/timezone and is constant-folded for scalar index lookups.
     """
+    if not isinstance(arrow_type, pa.TimestampType | pa.Time32Type | pa.Time64Type):
+        raise TypeError(f"Expected a temporal join key type, got {arrow_type}")
     unit = {
         "s": "Second",
         "ms": "Millisecond",
@@ -215,7 +230,7 @@ def _sql_temporal_literal(value: Any, arrow_type: pa.DataType) -> str:
     return f"arrow_cast({ticks}, {_sql_string_literal(type_name)})"
 
 
-def _join_key_values(column: pa.ChunkedArray) -> list[Any]:
+def _join_key_values(column: pa.ChunkedArray[Any]) -> list[Any]:
     """Keep temporal keys as integer ticks on both sides of the lookup."""
     arrow_type = _unwrap_dictionary_type(column.type)
     if pa.types.is_timestamp(arrow_type) or pa.types.is_time(arrow_type):
@@ -224,7 +239,19 @@ def _join_key_values(column: pa.ChunkedArray) -> list[Any]:
     return column.to_pylist()
 
 
+def _integer_column_values(column: pa.ChunkedArray[Any]) -> list[int]:
+    """Read non-null integer metadata without accepting missing row identities."""
+    values: list[int] = []
+    for value in column.to_pylist():
+        if not isinstance(value, int):
+            raise TypeError("Merge row identities must be non-null integers")
+        values.append(value)
+    return values
+
+
 def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
+    if not pa.types.is_decimal(arrow_type):
+        raise TypeError(f"Expected a decimal join key type, got {arrow_type}")
     precision = int(arrow_type.precision)
     scale = int(arrow_type.scale)
     if not isinstance(value, Decimal):
@@ -234,10 +261,7 @@ def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
 
 
 def _sql_binary_literal(value: Any) -> str:
-    if isinstance(value, str):
-        raw = value.encode("utf-8")
-    else:
-        raw = bytes(value)
+    raw = value.encode("utf-8") if isinstance(value, str) else bytes(value)
     return "X'" + raw.hex() + "'"
 
 
@@ -259,7 +283,10 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
         elif isinstance(value, datetime.time):
             arrow_type = pa.time64("us")
         elif isinstance(value, Decimal):
-            arrow_type = pa.decimal128(38, max(-value.as_tuple().exponent, 0))
+            exponent = value.as_tuple().exponent
+            if not isinstance(exponent, int):
+                raise ValueError("Non-finite decimal join keys are unsupported")
+            arrow_type = pa.decimal128(38, max(-exponent, 0))
         elif isinstance(value, bytes | bytearray | memoryview):
             arrow_type = pa.binary()
         else:
@@ -290,7 +317,7 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
     )
 
 
-def _chunked(seq: list, n: int):
+def _chunked(seq: list[_T], n: int) -> Iterator[list[_T]]:
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
 
@@ -309,7 +336,7 @@ def _align_chunk(chunk: pa.Table, target_schema: pa.Schema, on: str) -> pa.Table
     return chunk
 
 
-def _raise_on_duplicate_keys(keys: list, on: str, context: str) -> None:
+def _raise_on_duplicate_keys(keys: list[Any], on: str, context: str) -> None:
     if len(keys) != len(set(keys)):
         raise ValueError(
             f"Duplicate join keys detected ({context}). Source rows are "
@@ -427,6 +454,29 @@ def _drop_adjacent_duplicate_keys(batch: pa.Table, on: str) -> pa.Table:
     return batch.filter(mask)
 
 
+def _add_temporal_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table:
+    """Give Ray's Python sampling an exact integer key for temporal sorting."""
+    if not isinstance(batch, pa.Table):
+        raise TypeError("Merge source batches must be Arrow tables")
+    if batch.num_rows == 0:
+        return batch
+    keys = batch.column(on)
+    arrow_type = _unwrap_dictionary_type(keys.type)
+    integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
+    return batch.append_column(sort_column, keys.cast(arrow_type).cast(integer_type))
+
+
+def _dedupe_source_batch(batch: Any, *, on: str, sort_column: str | None) -> pa.Table:
+    """Remove a temporary sorting column before source rows reach planning."""
+    if not isinstance(batch, pa.Table):
+        raise TypeError("Merge source batches must be Arrow tables")
+    if batch.num_rows == 0:
+        return batch
+    if sort_column is not None:
+        batch = batch.drop_columns([sort_column])
+    return _drop_adjacent_duplicate_keys(batch, on)
+
+
 # ---------------------------------------------------------------------------
 # Ray tasks (module-level so they are picklable)
 # ---------------------------------------------------------------------------
@@ -439,13 +489,11 @@ def _plan_task(
     read_version: int,
     on: str,
     storage_options: Optional[dict[str, Any]],
-    namespace_impl: Optional[str],
-    namespace_properties: Optional[dict[str, str]],
-    table_id: Optional[list[str]],
+    namespace_args: _NamespaceArgs,
     source_chunk: pa.Table,
     target_schema: pa.Schema,
     n_apply: int,
-):
+) -> Iterator[dict[str, Any]]:
     """PLAN + map-side shuffle: map keys to target fragments, bucket by owner.
 
     This is a Ray generator task: it yields one payload per *non-empty*
@@ -473,9 +521,7 @@ def _plan_task(
             "elapsed_s": time.perf_counter() - t0,
         }
     else:
-        namespace_kwargs = get_namespace_kwargs(
-            namespace_impl, namespace_properties, table_id
-        )
+        namespace_kwargs = get_namespace_kwargs(*namespace_args)
         source_chunk = _align_chunk(source_chunk, target_schema, on)
         keys = _join_key_values(source_chunk.column(on))
         _raise_on_duplicate_keys(keys, on, f"plan task {task_id}")
@@ -499,16 +545,16 @@ def _plan_task(
             in_list = ", ".join(_sql_literal(key, key_type) for key in batch)
             # Backticks are Lance's identifier quoting (double quotes would be
             # parsed as a string literal by the filter planner).
-            hits = dataset.to_table(
+            hit_table = dataset.to_table(
                 columns=[on],
                 filter=f"`{on}` IN ({in_list})",
                 with_row_address=True,
                 with_row_id=True,
             )
             for key, rowaddr, rowid in zip(
-                _join_key_values(hits.column(on)),
-                hits.column("_rowaddr").to_pylist(),
-                hits.column("_rowid").to_pylist(),
+                _join_key_values(hit_table.column(on)),
+                _integer_column_values(hit_table.column("_rowaddr")),
+                _integer_column_values(hit_table.column("_rowid")),
                 strict=False,
             ):
                 fragment_id, offset = _rowaddr_parts(rowaddr)
@@ -545,8 +591,9 @@ def _plan_task(
             rowid_column,
             offset_column,
         )
-        for bucket in buckets:
-            yield bucket
+        # Ray sends acknowledgements into streaming generators. A delegated
+        # generator supports send(); a plain list iterator does not.
+        yield from (bucket for bucket in buckets)
         yield {
             "label": f"plan-{task_id}",
             "rows": len(keys),
@@ -568,7 +615,7 @@ def _apply_task(
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
     table_id: Optional[list[str]],
-    bucket_refs: list,
+    bucket_refs: list[ray.ObjectRef[dict[str, Any]]],
 ) -> dict[str, Any]:
     """APPLY: merge-on-read updates for a disjoint set of target fragments.
 
@@ -630,8 +677,8 @@ def _apply_task(
         # force the delete to rescan and decode the fragment's key column.
         # Join-all may place the same source key on this fragment more than
         # once (one copy per matching target row).
-        row_ids = source_rows.column(rowid_column).to_pylist()
-        offsets = source_rows.column(offset_column).to_pylist()
+        row_ids = _integer_column_values(source_rows.column(rowid_column))
+        offsets = _integer_column_values(source_rows.column(offset_column))
         _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
         _raise_on_duplicate_rowids(offsets, f"target fragment {fragment_id} offsets")
         source_rows = source_rows.drop_columns([rowid_column, offset_column])
@@ -680,28 +727,37 @@ def _apply_task(
 # ---------------------------------------------------------------------------
 
 
-def _bounded_map(remote_fn, arg_tuples: list[tuple], max_in_flight: int) -> list[dict]:
+def _bounded_map(
+    remote_fn: _RemoteTask, arg_tuples: list[tuple[Any, ...]], max_in_flight: int
+) -> list[dict[str, Any]]:
     """Run one Ray task per arg tuple with at most ``max_in_flight`` in flight."""
     total = len(arg_tuples)
-    results: list[dict] = []
-    pending: list = []
+    results: list[dict[str, Any]] = []
+    pending: list[ray.ObjectRef[dict[str, Any]]] = []
     i = 0
+
+    def _submit(j: int) -> None:
+        ref = remote_fn.remote(*arg_tuples[j])
+        if not isinstance(ref, ray.ObjectRef):
+            raise TypeError("Apply tasks must return a Ray ObjectRef")
+        pending.append(ref)
+
     while i < total and len(pending) < max_in_flight:
-        pending.append(remote_fn.remote(*arg_tuples[i]))
+        _submit(i)
         i += 1
     while pending:
         done, pending = ray.wait(pending, num_returns=1)
         result = ray.get(done[0])
         results.append(result)
         if i < total:
-            pending.append(remote_fn.remote(*arg_tuples[i]))
+            _submit(i)
             i += 1
     return results
 
 
 def _bounded_map_shuffle(
-    remote_fn, arg_tuples: list[tuple], max_in_flight: int
-) -> list[dict]:
+    remote_fn: _RemoteTask, arg_tuples: list[tuple[Any, ...]], max_in_flight: int
+) -> list[dict[str, Any]]:
     """``_bounded_map`` for plan tasks that yield a variable number of buckets.
 
     Each plan task is a Ray generator: non-empty owner payloads followed by a
@@ -712,17 +768,15 @@ def _bounded_map_shuffle(
     ``meta["bucket_owners"]``.
     """
     total = len(arg_tuples)
-    results: list[dict] = []
-    pending: dict = {}  # wait-key ObjectRef -> ObjectRefGenerator
+    results: list[dict[str, Any]] = []
+    pending: dict[ray.ObjectRef[Any], ray.ObjectRefGenerator] = {}
     i = 0
-
-    def _wait_key(gen: Any) -> Any:
-        completed = getattr(gen, "completed", None)
-        return completed() if callable(completed) else gen
 
     def _submit(j: int) -> None:
         gen = remote_fn.remote(*arg_tuples[j])
-        pending[_wait_key(gen)] = gen
+        if not isinstance(gen, ray.ObjectRefGenerator):
+            raise TypeError("Plan tasks must return a Ray ObjectRefGenerator")
+        pending[gen.completed()] = gen
 
     while i < total and len(pending) < max_in_flight:
         _submit(i)
@@ -771,7 +825,7 @@ def _deletion_file_identity(deletion_file: Any) -> tuple[Any, ...] | None:
 
 
 def _merge_operation_visible(
-    dataset: "lance.LanceDataset",
+    dataset: lance.LanceDataset,
     *,
     new_fragments: list[Any],
     updated_fragments: list[Any],
@@ -809,14 +863,14 @@ def _merge_operation_visible(
 
 def _commit_update(
     uri: str,
-    operation: "lance.LanceOperation.Update",
+    operation: lance.LanceOperation.Update,
     read_version: int,
     storage_options: dict[str, Any],
     namespace_kwargs: dict[str, Any],
     new_fragments: list[Any],
     updated_fragments: list[Any],
     removed_fragment_ids: list[int],
-) -> "lance.LanceDataset":
+) -> lance.LanceDataset:
     """Commit ``operation``, treating a lost success ack as success.
 
     Does not retry by submitting a second transaction. If ``commit`` raises
@@ -890,7 +944,7 @@ def _write_append_fragments(
 ) -> list[Any]:
     if table.num_rows == 0:
         return []
-    return lance.fragment.write_fragments(
+    fragments = lance.fragment.write_fragments(
         table,
         uri,
         mode="append",
@@ -898,9 +952,12 @@ def _write_append_fragments(
         enable_stable_row_ids=enable_stable_row_ids,
         **write_kwargs,
     )
+    if not isinstance(fragments, list):
+        raise TypeError("Fragment append must return fragment metadata")
+    return fragments
 
 
-def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
+def _has_scalar_index_on(dataset: lance.LanceDataset, column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
             for index in dataset.describe_indices():
@@ -909,11 +966,11 @@ def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
                 if any(name.strip('"') == column for name in names):
                     return True
             return False
-        for index in dataset.list_indices():
+        for legacy_index in dataset.list_indices():
             fields = (
-                index.get("fields")
-                if isinstance(index, dict)
-                else getattr(index, "fields", None)
+                legacy_index.get("fields")
+                if isinstance(legacy_index, dict)
+                else getattr(legacy_index, "fields", None)
             )
             if fields and column in fields:
                 return True
@@ -924,7 +981,7 @@ def _has_scalar_index_on(dataset: "lance.LanceDataset", column: str) -> bool:
 
 def _source_to_chunk_refs(
     source: ray.data.Dataset | pa.Table, on: str, num_partitions: int
-) -> list["ray.ObjectRef"]:
+) -> list[ray.ObjectRef[pa.Table]]:
     """Sort-dedupe the source on the join key; return Arrow-table ObjectRefs.
 
     The source is range-partitioned with a Ray Data sort on the key: all
@@ -942,12 +999,26 @@ def _source_to_chunk_refs(
             "source must be a ray.data.Dataset or a pyarrow.Table, got "
             f"{type(source).__name__}"
         )
+    sort_column = None
+    source_schema = source.schema()
+    if source_schema is not None and isinstance(source_schema.base_schema, pa.Schema):
+        key_type = _unwrap_dictionary_type(source_schema.base_schema.field(on).type)
+        if pa.types.is_time(key_type) or pa.types.is_timestamp(key_type):
+            # Ray samples sort boundaries with Arrow's to_pylist(). Python time
+            # cannot represent time64[ns] values containing nonzero nanoseconds.
+            # Integer ticks preserve exact ordering and keep duplicate keys in
+            # one partition; the original Arrow column remains untouched.
+            sort_column = _unused_column_name(_SORT_COLUMN, set(source_schema.names))
+            source = source.map_batches(
+                partial(_add_temporal_sort_key, on=on, sort_column=sort_column),
+                batch_size=None,
+                batch_format="pyarrow",
+            )
     deduped = (
         source.repartition(num_partitions)
-        .sort(on)
+        .sort(sort_column or on)
         .map_batches(
-            _drop_adjacent_duplicate_keys,
-            fn_kwargs={"on": on},
+            partial(_dedupe_source_batch, on=on, sort_column=sort_column),
             batch_size=None,
             batch_format="pyarrow",
         )
@@ -973,7 +1044,7 @@ def merge_into(
     num_workers: int = 4,
     num_partitions: Optional[int] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
-) -> "lance.LanceDataset":
+) -> lance.LanceDataset:
     """Distributed merge of ``ds`` into a Lance dataset.
 
     Every source row that matches a target row on the ``on`` key replaces
@@ -1118,9 +1189,7 @@ def merge_into(
             read_version,
             on,
             storage_options,
-            namespace_impl,
-            namespace_properties,
-            table_id,
+            (namespace_impl, namespace_properties, table_id),
             chunk_ref,
             target_schema,
             num_workers,
@@ -1143,7 +1212,9 @@ def merge_into(
     # Phase 2: route each bucket's ObjectRef to its owning apply task. The
     # refs are nested in a list on purpose so Ray does not resolve them on
     # the driver; the apply task fetches them node-to-node itself.
-    refs_by_owner: dict[int, list] = collections.defaultdict(list)
+    refs_by_owner: dict[int, list[ray.ObjectRef[dict[str, Any]]]] = (
+        collections.defaultdict(list)
+    )
     for meta in plan_results:
         for owner, ref in zip(meta["bucket_owners"], meta["bucket_refs"], strict=True):
             refs_by_owner[owner].append(ref)
