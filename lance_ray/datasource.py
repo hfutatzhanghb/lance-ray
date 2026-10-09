@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterator
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -27,10 +27,13 @@ if TYPE_CHECKING:
     import lance
 
 
-# Ray 2.41+ builds each logical Read source name from ``Datasource.get_name()``.
-# Keep provenance there instead of the user-controlled Dataset metrics name.
+# Older builds embedded provenance in ``Datasource.get_name()``. Ray prints that
+# name in every execution plan, so new reads keep the digest on the datasource
+# object instead. ``parse_source_provenance`` still accepts the historical name.
 LANCE_SOURCE_VERSION_NAME_PREFIX = "LanceDatasource[lance_ray_source_version="
 LANCE_SOURCE_ID_MARKER = ";lance_ray_source_id="
+_S3_ENDPOINT_ENV_VARS = ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+_GCS_ENDPOINT_ENV_VARS = ("STORAGE_EMULATOR_HOST",)
 _WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 _WINDOWS_FILE_URI_PATH = re.compile(r"^/[A-Za-z]:[\\/]")
 
@@ -65,13 +68,46 @@ def normalize_dataset_uri(uri: str) -> str:
     return os.path.realpath(os.path.abspath(uri)).rstrip(os.sep)
 
 
+def _sanitize_endpoint(value: str) -> str:
+    """Drop credentials and query strings from an object-store endpoint."""
+    has_scheme = "://" in value
+    parsed = urlsplit(value if has_scheme else f"//{value}")
+    hostname = parsed.hostname
+    if hostname is None:
+        return value
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    port = parsed.port
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    sanitized = urlunsplit(
+        (parsed.scheme if has_scheme else "", netloc, parsed.path, "", "")
+    )
+    if not has_scheme:
+        sanitized = sanitized.removeprefix("//")
+    return sanitized
+
+
+def _endpoint_from_environment(scheme: str) -> Optional[str]:
+    """Return an endpoint configured only through process environment."""
+    keys: tuple[str, ...]
+    if scheme == "s3":
+        keys = _S3_ENDPOINT_ENV_VARS
+    elif scheme in {"gs", "gcs"}:
+        keys = _GCS_ENDPOINT_ENV_VARS
+    else:
+        return None
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
 def _non_sensitive_backend_identity(
     storage_options: Optional[dict[str, Any]],
+    uri: str = "",
 ) -> Optional[str]:
     """Return a stable, non-secret backend discriminator when one is available."""
-    if not storage_options:
-        return None
-
     endpoint_keys = (
         "endpoint",
         "endpoint_url",
@@ -82,30 +118,21 @@ def _non_sensitive_backend_identity(
         "oss_endpoint",
         "tos_endpoint",
     )
-    for key in endpoint_keys:
-        value = storage_options.get(key)
-        if not value:
-            continue
-        value = str(value)
-        has_scheme = "://" in value
-        parsed = urlsplit(value if has_scheme else f"//{value}")
-        hostname = parsed.hostname
-        if hostname is not None:
-            if ":" in hostname:
-                hostname = f"[{hostname}]"
-            port = parsed.port
-            netloc = hostname if port is None else f"{hostname}:{port}"
-            value = urlunsplit(
-                (parsed.scheme if has_scheme else "", netloc, parsed.path, "", "")
-            )
-            if not has_scheme:
-                value = value.removeprefix("//")
-        return f"endpoint:{value}"
+    if storage_options:
+        for key in endpoint_keys:
+            value = storage_options.get(key)
+            if not value:
+                continue
+            return f"endpoint:{_sanitize_endpoint(str(value))}"
 
-    for key in ("account_name", "azure_storage_account_name"):
-        value = storage_options.get(key)
-        if value:
-            return f"azure_account:{value}"
+        for key in ("account_name", "azure_storage_account_name"):
+            value = storage_options.get(key)
+            if value:
+                return f"azure_account:{value}"
+
+    env_endpoint = _endpoint_from_environment(_uri_scheme(uri))
+    if env_endpoint:
+        return f"endpoint:{_sanitize_endpoint(env_endpoint)}"
     return None
 
 
@@ -123,10 +150,10 @@ def _has_reliable_identity(
 ) -> bool:
     if _dataset_uuid(lance_ds) is not None:
         return True
-    if _non_sensitive_backend_identity(storage_options) is not None:
+    identity_uri = str(getattr(lance_ds, "uri", "") or "")
+    if _non_sensitive_backend_identity(storage_options, identity_uri) is not None:
         return True
 
-    identity_uri = str(getattr(lance_ds, "uri", "") or "")
     scheme = _uri_scheme(identity_uri)
     # S3 and GCS bucket names identify the backend without credentials. Azure
     # container names are account-scoped, so Azure still requires an account or
@@ -160,7 +187,7 @@ def dataset_identity(
     if uuid_value:
         identity_parts.append(f"uuid:{uuid_value}")
     identity_parts.append(f"uri:{normalized_uri}")
-    backend = _non_sensitive_backend_identity(storage_options)
+    backend = _non_sensitive_backend_identity(storage_options, identity_uri)
     if backend is not None:
         identity_parts.append(f"backend:{backend}")
     return "|".join(identity_parts)
@@ -331,13 +358,14 @@ class LanceDatasource(Datasource):
         self._pin_source_provenance()
 
     def get_name(self) -> str:
-        """Return a logical source name carrying immutable snapshot provenance."""
-        identity = self.source_identity
-        identity_text = "unavailable" if identity is None else quote(identity, safe="")
-        return (
-            f"{LANCE_SOURCE_VERSION_NAME_PREFIX}{self.source_version}"
-            f"{LANCE_SOURCE_ID_MARKER}{identity_text}]"
-        )
+        """Return the logical source name Ray prints in execution plans.
+
+        Snapshot version and the dataset identity digest stay on this object.
+        Putting the digest in the operator name shows up in every
+        ``read_lance`` execution plan, including reads that never call
+        ``update_columns_from``.
+        """
+        return "LanceDatasource"
 
     @property
     def fragments(self) -> list[lance.LanceFragment]:
@@ -404,6 +432,7 @@ class LanceDatasource(Datasource):
                     for field in block_schema
                     if field.name not in {"_rowaddr", "_fragid"}
                 )
+            block_schema = _schema_with_ray_blob_types(block_schema)
 
         for fragments in array_split(self.fragments, parallelism):
             if len(fragments) == 0:
@@ -482,6 +511,54 @@ class LanceDatasource(Datasource):
         return sum(file_sizes)
 
 
+def _blob_column_kind(field: pa.Field[Any]) -> Optional[str]:
+    """Return how a top-level field is exposed after blob reconstruction.
+
+    ``"v2"`` is a ``lance.blob.v2`` extension column. ``"legacy"`` is a
+    large-binary field marked ``lance-encoding:blob``. Readers replace both
+    with ``large_binary`` bytes; legacy fields keep their encoding metadata.
+    """
+    field_type = field.type
+    if isinstance(field_type, pa.ExtensionType):
+        ext_name = getattr(field_type, "extension_name", None)
+        if ext_name == "lance.blob.v2":
+            return "v2"
+
+    try:
+        is_large_bin = field_type == pa.large_binary()
+    except Exception:
+        is_large_bin = False
+    if not is_large_bin:
+        return None
+
+    meta = field.metadata
+    if meta is None:
+        return None
+    if (meta.get("lance-encoding:blob") == "true") or (  # type: ignore[call-overload]
+        meta.get(b"lance-encoding:blob") == b"true"
+    ):
+        return "legacy"
+    return None
+
+
+def _field_as_ray_blob(field: pa.Field[Any]) -> pa.Field[Any]:
+    kind = _blob_column_kind(field)
+    if kind is None:
+        return field
+    metadata = field.metadata if kind == "legacy" else None
+    return pa.field(
+        field.name,
+        pa.large_binary(),
+        nullable=field.nullable,
+        metadata=metadata,
+    )
+
+
+def _schema_with_ray_blob_types(schema: pa.Schema) -> pa.Schema:
+    """Match block metadata to the large-binary values blob reads yield."""
+    return pa.schema(_field_as_ray_blob(field) for field in schema)
+
+
 def _read_fragments_with_retry(
     fragment_ids: list[int],
     uri: str,
@@ -556,47 +633,11 @@ def _read_fragments(
     # Map column name -> blob kind ("legacy" or "v2")
     blob_columns: dict[str, str] = {}
 
-    def _is_blob_field(f: pa.Field[Any]) -> Optional[str]:
-        """Detect Lance blob columns.
-
-        Returns:
-            "v2" for blob v2 extension columns,
-            "legacy" for legacy metadata-based blob columns,
-            or None if the field is not a blob.
-        """
-        field_type = f.type
-
-        # Blob v2: extension type `lance.blob.v2`
-        if isinstance(field_type, pa.ExtensionType):
-            ext_name = getattr(field_type, "extension_name", None)
-            if ext_name == "lance.blob.v2":
-                return "v2"
-
-        # Legacy: LargeBinary with field metadata {"lance-encoding:blob": "true"}
-        try:
-            is_large_bin = field_type == pa.large_binary()
-        except Exception:
-            is_large_bin = False
-        if not is_large_bin:
-            return None
-
-        meta = f.metadata
-        if meta is None:
-            return None
-
-        # pyarrow may store metadata keys/values as str
-        if (meta.get("lance-encoding:blob") == "true") or (  # type: ignore[call-overload]
-            meta.get(b"lance-encoding:blob") == b"true"
-        ):
-            return "legacy"
-
-        return None
-
     # Build list of blob columns to reconstruct, honoring column projection
     ds_field_names = ds_schema.names
     for idx, name in enumerate(ds_field_names):
         field = ds_schema.field(idx)
-        kind = _is_blob_field(field)
+        kind = _blob_column_kind(field)
         if kind is None:
             continue
         if requested_columns is None:

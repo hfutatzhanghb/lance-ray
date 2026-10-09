@@ -1,5 +1,6 @@
 """Tests for update_columns_from."""
 
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -8,6 +9,7 @@ import lance
 import lance_ray as lr
 import lance_ray.datasource as datasource_module
 import lance_ray.io as lance_io
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
@@ -19,8 +21,10 @@ from lance_ray.datasource import (
     dataset_identity_digest,
     normalize_dataset_uri,
 )
+from lance_ray.io import _first_duplicate_rowaddr, _portable_roaring_cardinality
 from ray.data import Dataset, Schema
 from ray.data.block import DataBatch
+from ray.data.context import DataContext
 from ray.exceptions import RayTaskError
 
 import pandas as pd
@@ -360,8 +364,9 @@ def test_update_columns_from_source_lineage_does_not_expose_uri(
     logical_plan = cast(Any, source)._logical_plan
     source_name = logical_plan.sources()[0].name
 
+    assert source_name == "ReadLanceDatasource"
     assert str(multi_fragment_path) not in source_name
-    assert "lance_ray_source_id=" in source_name
+    assert "lance_ray_source_id=" not in source_name
 
     lr.update_columns_from(
         str(multi_fragment_path),
@@ -428,6 +433,106 @@ def test_dataset_identity_excludes_endpoint_credentials() -> None:
     assert "first" not in first
     assert "secret" not in first
     assert "token" not in first
+
+
+def test_dataset_identity_includes_s3_endpoint_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLanceDataset:
+        uri = "s3://bucket/table"
+        _ds = object()
+
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://minio-a:9000")
+    first = dataset_identity(FakeLanceDataset())
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://minio-b:9000")
+    second = dataset_identity(FakeLanceDataset())
+
+    assert first != second
+    assert "minio-a" in first
+    assert "minio-b" in second
+
+
+def test_dataset_identity_prefers_storage_options_endpoint_over_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLanceDataset:
+        uri = "s3://bucket/table"
+        _ds = object()
+
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL",
+        "https://env-user:env-secret@minio-env.example:9000/api?token=env",
+    )
+    identity = dataset_identity(
+        FakeLanceDataset(),
+        storage_options={"endpoint": "http://minio-opt:9000"},
+    )
+
+    assert "minio-opt" in identity
+    assert "minio-env" not in identity
+    assert "env-secret" not in identity
+
+
+def test_dataset_identity_strips_environment_endpoint_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLanceDataset:
+        uri = "s3://bucket/table"
+        _ds = object()
+
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL",
+        "https://user:secret@minio.example:9000/api?token=one",
+    )
+    identity = dataset_identity(FakeLanceDataset())
+
+    assert "minio.example:9000" in identity
+    assert "secret" not in identity
+    assert "token" not in identity
+
+
+def test_s3_endpoint_environment_variable_takes_service_specific_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLanceDataset:
+        uri = "s3://bucket/table"
+        _ds = object()
+
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://generic:9000")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000")
+    identity = dataset_identity(FakeLanceDataset())
+
+    assert "s3-specific:9000" in identity
+    assert "generic" not in identity
+
+
+def test_first_duplicate_rowaddr_merges_sorted_runs() -> None:
+    left = np.array([1, 3, 5, 8], dtype=np.uint64)
+    right = np.array([2, 4, 8, 9], dtype=np.uint64)
+    unique = np.array([0, 6, 7], dtype=np.uint64)
+
+    assert _first_duplicate_rowaddr([left, right], window=2) == 8
+    assert _first_duplicate_rowaddr([left, unique], window=2) is None
+    assert (
+        _first_duplicate_rowaddr(
+            [np.array([4, 4, 5], dtype=np.uint64)],
+            window=2,
+        )
+        == 4
+    )
+    high = np.array([np.iinfo(np.uint64).max], dtype=np.uint64)
+    assert _first_duplicate_rowaddr([high, high.copy()], window=1) == int(high[0])
+
+
+def test_portable_roaring_cardinality_reads_container_headers() -> None:
+    no_runs = struct.pack("<IIHHI", 12346, 1, 0, 4, 0)
+    assert _portable_roaring_cardinality(no_runs) == 5
+
+    # One run-format container, cardinality stored as card-1 == 0.
+    with_runs = struct.pack("<IBHH", 12347, 0, 0, 0)
+    assert _portable_roaring_cardinality(with_runs) == 1
 
 
 def test_datasource_caches_unavailable_source_identity(
@@ -840,7 +945,7 @@ def test_update_columns_from_ignores_unmatched_rowaddr(
         replace_rowaddr, batch_format="pyarrow"
     )
 
-    lr.update_columns_from(
+    updated_rows = lr.update_columns_from(
         str(multi_fragment_path),
         source,
         columns=["value"],
@@ -852,6 +957,7 @@ def test_update_columns_from_ignores_unmatched_rowaddr(
         .sort_values("id")
         .reset_index(drop=True)
     )
+    assert updated_rows == 3
     assert result["value"].tolist() == [10, 20, 30, 40]
 
 
@@ -960,6 +1066,7 @@ def test_update_columns_from_commits_rewrite_columns_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     committed_update_modes: list[str] = []
+    committed_offsets: list[dict[int, bytes]] = []
     original_commit = cast(Callable[..., LanceDataset], LanceDataset.commit)
 
     def capturing_commit(
@@ -970,18 +1077,78 @@ def test_update_columns_from_commits_rewrite_columns_operation(
     ) -> LanceDataset:
         assert isinstance(operation, lance.LanceOperation.Update)
         committed_update_modes.append(operation.update_mode)
+        assert operation.updated_fragment_offsets is not None
+        committed_offsets.append(operation.updated_fragment_offsets)
+        assert operation.fields_modified == sorted(operation.fields_modified)
         return original_commit(base_uri, operation, *args, **kwargs)
 
     source = lr.read_lance(str(multi_fragment_path), with_metadata=True)
     monkeypatch.setattr(LanceDataset, "commit", capturing_commit)
 
-    lr.update_columns_from(
+    updated_rows = lr.update_columns_from(
         str(multi_fragment_path),
         source,
         columns=["value"],
     )
 
+    assert updated_rows == 4
     assert committed_update_modes == ["rewrite_columns"]
+    assert committed_offsets
+    offset_cardinality = sum(
+        _portable_roaring_cardinality(offsets)
+        for fragment_offsets in committed_offsets
+        for offsets in fragment_offsets.values()
+    )
+    assert offset_cardinality == updated_rows
+
+
+def _row_version_meta(fragment: Any) -> str | None:
+    meta = fragment.metadata.last_updated_at_version_meta
+    if meta is None:
+        return None
+    return str(meta.json())
+
+
+def test_update_columns_from_refreshes_matched_stable_row_versions(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "stable_update.lance"
+    lance.write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "value": [10, 20, 30, 40]}),
+        str(path),
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    before = {
+        fragment.metadata.id: _row_version_meta(fragment)
+        for fragment in lance.dataset(str(path)).get_fragments()
+    }
+    assert any(meta is not None for meta in before.values())
+
+    def bump_id_one(batch: DataBatch) -> pd.DataFrame:
+        frame = cast(pd.DataFrame, batch).copy()
+        frame["value"] = 101
+        return frame
+
+    source = (
+        lr.read_lance(str(path), with_metadata=True)
+        .filter(lambda row: row["id"] == 1)
+        .map_batches(bump_id_one, batch_format="pandas")
+    )
+    updated_rows = lr.update_columns_from(str(path), source, columns=["value"])
+    assert updated_rows == 1
+
+    after_dataset = lance.dataset(str(path))
+    result = after_dataset.to_table().sort_by("id")
+    assert result.column("value").to_pylist() == [101, 20, 30, 40]
+    after = {
+        fragment.metadata.id: _row_version_meta(fragment)
+        for fragment in after_dataset.get_fragments()
+    }
+    changed = [frag_id for frag_id, meta in after.items() if meta != before[frag_id]]
+    unchanged = [frag_id for frag_id, meta in after.items() if meta == before[frag_id]]
+    assert changed
+    assert unchanged
 
 
 def test_update_columns_from_requires_dataset(multi_fragment_path: Path) -> None:
@@ -1153,6 +1320,16 @@ def test_update_columns_from_rejects_pandas_object_type_mismatch(
     multi_fragment_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Ray >= 2.56 turns pandas UDFs into arrow-backed string arrays, so the
+    # driver schema is a concrete pa.string() and this branch never runs.
+    data_context = DataContext.get_current()
+    if hasattr(data_context, "enable_arrow_backed_pandas_conversion"):
+        monkeypatch.setattr(
+            data_context,
+            "enable_arrow_backed_pandas_conversion",
+            False,
+        )
+
     def cast_value_to_object(batch: DataBatch) -> pd.DataFrame:
         frame = cast(pd.DataFrame, batch).copy()
         frame["value"] = frame["value"].astype(str)
@@ -1683,29 +1860,32 @@ def test_update_columns_from_warns_for_empty_source(
     )
     version_before = lance.dataset(str(multi_fragment_path)).version
 
-    lr.update_columns_from(
+    updated_rows = lr.update_columns_from(
         str(multi_fragment_path),
         source,
         columns=["value"],
     )
 
+    assert updated_rows == 0
     assert "No rows to update" in caplog.text
     assert lance.dataset(str(multi_fragment_path)).version == version_before
 
 
 @pytest.mark.parametrize(
-    ("source_columns", "requested_columns", "error_match"),
+    ("source_columns", "requested_columns", "error_match", "pass_read_version"),
     [
         pytest.param(
             {"value": pa.array([], type=pa.int64())},
             ["value"],
             "must contain '_rowaddr'",
+            False,
             id="missing-rowaddr",
         ),
         pytest.param(
             {"_rowaddr": pa.array([], type=pa.uint64())},
             ["missing"],
             "missing requested update columns",
+            False,
             id="missing-source-column",
         ),
         pytest.param(
@@ -1715,6 +1895,7 @@ def test_update_columns_from_warns_for_empty_source(
             },
             ["missing"],
             "do not exist in target",
+            True,
             id="missing-target-column",
         ),
     ],
@@ -1724,6 +1905,7 @@ def test_update_columns_from_validates_empty_source(
     source_columns: dict[str, Any],
     requested_columns: list[str],
     error_match: str,
+    pass_read_version: bool,
 ) -> None:
     source = ray.data.from_arrow(pa.table(source_columns))
     version_before = lance.dataset(str(multi_fragment_path)).version
@@ -1733,6 +1915,7 @@ def test_update_columns_from_validates_empty_source(
             str(multi_fragment_path),
             source,
             columns=requested_columns,
+            read_version=version_before if pass_read_version else None,
         )
 
     assert lance.dataset(str(multi_fragment_path)).version == version_before
@@ -1838,13 +2021,14 @@ def test_update_columns_from_empty_source_without_fragid(
     )
     version_before = lance.dataset(str(multi_fragment_path)).version
 
-    lr.update_columns_from(
+    updated_rows = lr.update_columns_from(
         str(multi_fragment_path),
         source,
         columns=["value"],
         read_version=version_before,
     )
 
+    assert updated_rows == 0
     assert "No rows to update" in caplog.text
     assert lance.dataset(str(multi_fragment_path)).version == version_before
 

@@ -46,7 +46,7 @@ update_columns_from(
     namespace_properties=None,
     table_id=None,
     batch_size=1024,
-)
+) -> int
 ```
 
 Update existing columns in a Lance dataset using row metadata. The input Ray
@@ -80,8 +80,10 @@ The final update operation is committed once against the dataset version that
 was originally read. Commit conflicts are returned to the caller; safely
 retrying requires rerunning the update pipeline from the latest dataset version.
 `read_lance()` retains that version and an irreversible SHA-256 digest of the
-stable dataset identity in Ray's logical source lineage, so renaming or
-combining lazy Dataset branches does not change the update base. Combining rows
+stable dataset identity on the Lance datasource object. Ray's execution-plan
+logs only show `ReadLanceDatasource`; the digest is not part of the operator
+name. Renaming or combining lazy Dataset branches does not change the update
+base. Combining rows
 from different Lance datasets, or updating a different dataset than the one
 that was read, is rejected even when the version numbers match, but only while
 that source lineage remains present. If an operation replaces the lineage, such
@@ -98,6 +100,27 @@ Before fragment partitioning, the source is projected to `_rowaddr`, `_fragid`
 when present, and the columns listed in `columns`. Unused source columns are
 not routed into fragment update workers, and each fragment is streamed as
 bounded `RecordBatch` values rather than materialized as a full table.
+Partitions are sorted by `_rowaddr`, and duplicate addresses are rejected by a
+k-way merge of those sorted runs. The returned integer is the number of source
+rows that matched an existing target row.
+
+The commit is `LanceOperation.Update` with `update_mode="rewrite_columns"` and
+`updated_fragment_offsets`. On a dataset with stable row ids, those offsets are
+what lets Lance refresh `_row_last_updated_at_version` for the matched rows.
+
+The driver keeps every partition object reference until the function returns.
+Those objects are `ray.put` values owned by the partition workers and have no
+lineage, so the object store holds the partitioned copy for the whole update
+(about twice the source data at peak) and a lost worker raises `ObjectLostError`
+instead of recomputing the block. Fragment updates also wait until every
+partition task has finished. If one fragment task fails, files already written
+by the other tasks stay uncommitted and are not deleted, the same as
+`merge_columns_from`.
+
+An S3 or GCS endpoint that is set only through the process environment
+(`AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, or `STORAGE_EMULATOR_HOST`) is part
+of the dataset identity. `storage_options` still take precedence over those
+variables. The identity does not include credentials from the endpoint URL.
 
 **Parameters:**
 
@@ -116,4 +139,5 @@ bounded `RecordBatch` values rather than materialized as a full table.
 - `namespace_impl`, `namespace_properties`, `table_id`: Namespace resolution arguments.
 - `batch_size`: Batch size for the update reader. Must be positive.
 
-**Returns:** None
+**Returns:** The number of source rows that matched an existing target row.
+Unmatched row addresses are ignored. An empty source returns `0`.
