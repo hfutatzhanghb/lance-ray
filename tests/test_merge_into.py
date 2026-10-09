@@ -265,11 +265,15 @@ def test_fragment_match_ids_drop_parent_bucket_buffers() -> None:
         }
     )
     view = parent.slice(5, 2)
-    row_buf = view.column("rowid").chunk(0).buffers()[1]
-    offset_buf = view.column("offset").chunk(0).buffers()[1]
+    # pyarrow-stubs types ChunkedArray.chunk() as ChunkedArray, which has no
+    # buffers. chunks is list[Array].
+    row_array = view.column("rowid").chunks[0]
+    offset_array = view.column("offset").chunks[0]
+    row_buf = row_array.buffers()[1]
+    offset_buf = offset_array.buffers()[1]
     assert row_buf is not None and offset_buf is not None
-    assert row_buf.size > view.column("rowid").nbytes
-    assert offset_buf.size > view.column("offset").nbytes
+    assert row_buf.size > row_array.nbytes
+    assert offset_buf.size > offset_array.nbytes
     row_refs = sys.getrefcount(row_buf)
     offset_refs = sys.getrefcount(offset_buf)
 
@@ -288,11 +292,15 @@ def test_fragment_match_ids_drop_parent_bucket_buffers() -> None:
         assert data.address != offset_buf.address
 
     root = pa.allocate_buffer(1 << 20)
-    memory = np.ndarray(shape=(1,), dtype=np.int64, buffer=memoryview(root))
+    memory: np.ndarray[tuple[int], np.dtype[np.int64]] = np.ndarray(
+        shape=(1,), dtype=np.int64, buffer=memoryview(root)
+    )
     memory[0] = 42
     shared = pa.Array.from_buffers(pa.int64(), 1, [None, root])
     assert shared.nbytes == 8
-    assert shared.buffers()[1].size == root.size
+    shared_buf = shared.buffers()[1]
+    assert shared_buf is not None
+    assert shared_buf.size == root.size
     root_refs = sys.getrefcount(root)
     matches.append(shared, shared)
     assert sys.getrefcount(root) == root_refs
