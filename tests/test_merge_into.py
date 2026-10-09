@@ -197,6 +197,43 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
     assert _sql_literal(wide, pa.decimal256(40, 0)) == f"DECIMAL(40,0) '{wide}'"
 
 
+def test_fragment_match_ids_stay_packed_and_release() -> None:
+    """Row ids and offsets must not accumulate as Python lists or sets."""
+    import tracemalloc
+
+    import numpy as np
+    from lance_ray.merge_into import _FragmentMatchIds
+
+    n = 200_000
+    batch = 10_000
+    matches = _FragmentMatchIds()
+    tracemalloc.start()
+    for start in range(0, n, batch):
+        values = pa.array(np.arange(start, start + batch, dtype=np.int64))
+        matches.append(values, values)
+    matches.release_row_ids_after_duplicate_check("fragment 1")
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    offsets = matches.take_offsets_after_duplicate_check("fragment 1 offsets")
+
+    assert matches.row_ids == []
+    assert matches.offsets == []
+    assert len(offsets) == n
+    assert offsets[0].as_py() == 0
+    assert offsets[n - 1].as_py() == n - 1
+    # A Python list plus a duplicate-detecting set of 200k ints is tens of
+    # MiB. Packed Arrow buffers are not allocated on the Python heap.
+    assert peak < 8 * 1024 * 1024
+
+    duplicate = _FragmentMatchIds()
+    duplicate.append(
+        pa.array([1, 2], type=pa.int64()), pa.array([0, 1], type=pa.int64())
+    )
+    duplicate.append(pa.array([2], type=pa.int64()), pa.array([2], type=pa.int64()))
+    with pytest.raises(RuntimeError, match="Duplicate target row ids"):
+        duplicate.release_row_ids_after_duplicate_check("fragment 1")
+
+
 def test_schema_field_ids_include_nested_leaves() -> None:
     """Index maintenance needs leaf ids, not only top-level field ids."""
     from lance.schema import LanceSchema

@@ -367,12 +367,73 @@ def _raise_on_duplicate_keys(keys: list[Any], on: str, context: str) -> None:
         )
 
 
-def _raise_on_duplicate_rowids(row_ids: list[int], context: str) -> None:
-    if len(row_ids) != len(set(row_ids)):
+def _raise_if_duplicate_integers(chunks: list[pa.Array[Any]], context: str) -> None:
+    """Reject duplicate ids without building a Python ``set`` of every value."""
+    if not chunks:
+        return
+    values = pa.chunked_array(chunks)
+    n = len(values)
+    if n <= 1:
+        return
+    ordered = values.take(pc.sort_indices(values))
+    adjacent = pc.equal(ordered.slice(0, n - 1), ordered.slice(1))
+    if pc.any(adjacent).as_py():
         raise RuntimeError(
             f"Duplicate target row ids detected ({context}). Each matched "
             "target row must be updated at most once."
         )
+
+
+class _FragmentMatchIds:
+    """Packed integer identities for one target fragment.
+
+    Row ids and offsets stay in Arrow buffers (about eight bytes each) instead
+    of Python lists. Row ids are released after the duplicate check. Offsets
+    are handed to ``delete_rows`` and then released, before any replacement
+    bucket is written. Preserved stable row ids are read later from the single
+    bucket being written.
+    """
+
+    __slots__ = ("row_ids", "offsets")
+
+    def __init__(self) -> None:
+        self.row_ids: list[pa.Array[Any]] = []
+        self.offsets: list[pa.Array[Any]] = []
+
+    def append(
+        self,
+        row_ids: pa.Array[Any] | pa.ChunkedArray[Any],
+        offsets: pa.Array[Any] | pa.ChunkedArray[Any],
+    ) -> None:
+        self.row_ids.extend(_integer_chunks(row_ids))
+        self.offsets.extend(_integer_chunks(offsets))
+
+    def release_row_ids_after_duplicate_check(self, context: str) -> None:
+        _raise_if_duplicate_integers(self.row_ids, context)
+        self.row_ids.clear()
+
+    def take_offsets_after_duplicate_check(self, context: str) -> pa.ChunkedArray[Any]:
+        _raise_if_duplicate_integers(self.offsets, context)
+        offsets = pa.chunked_array(self.offsets)
+        self.offsets.clear()
+        return offsets
+
+
+def _integer_chunks(
+    column: pa.Array[Any] | pa.ChunkedArray[Any],
+) -> list[pa.Array[Any]]:
+    """Keep an integer column's buffers without copying values into Python."""
+    if isinstance(column, pa.Array):
+        chunks = [column]
+        null_count = column.null_count
+        column_type = column.type
+    else:
+        chunks = list(column.chunks)
+        null_count = column.null_count
+        column_type = column.type
+    if null_count or not pa.types.is_integer(column_type):
+        raise TypeError("Merge row identities must be non-null integers")
+    return chunks
 
 
 def _with_rowid_column(
@@ -631,17 +692,15 @@ def _collect_bucket_matches(
     payload: dict[str, Any],
     rowid_column: str,
     offset_column: str,
-    row_ids_by_fragment: dict[int, list[int]],
-    offsets_by_fragment: dict[int, list[int]],
+    matches_by_fragment: dict[int, _FragmentMatchIds],
 ) -> None:
-    """Record per-fragment row ids and physical offsets from one bucket."""
+    """Record packed per-fragment row ids and offsets from one bucket."""
     for fragment_id, table in payload["frags"].items():
-        row_ids_by_fragment[fragment_id].extend(
-            _integer_column_values(table.column(rowid_column))
-        )
-        offsets_by_fragment[fragment_id].extend(
-            _integer_column_values(table.column(offset_column))
-        )
+        matches = matches_by_fragment.get(fragment_id)
+        if matches is None:
+            matches = _FragmentMatchIds()
+            matches_by_fragment[fragment_id] = matches
+        matches.append(table.column(rowid_column), table.column(offset_column))
 
 
 def _write_bucket(
@@ -661,9 +720,10 @@ def _write_bucket(
     so inserts do not have to be a suffix of one combined table.
     """
     replacement_parts: list[pa.Table] = []
-    replacement_row_ids: list[int] = []
+    row_id_chunks: list[pa.Array[Any]] = []
     for table in payload["frags"].values():
-        replacement_row_ids.extend(_integer_column_values(table.column(rowid_column)))
+        if enable_stable_row_ids:
+            row_id_chunks.extend(_integer_chunks(table.column(rowid_column)))
         replacement_parts.append(table.drop_columns([rowid_column, offset_column]))
 
     written: list[Any] = []
@@ -682,7 +742,10 @@ def _write_bucket(
             enable_stable_row_ids=enable_stable_row_ids,
         )
         if enable_stable_row_ids:
-            fragments = _attach_preserved_row_ids(fragments, replacement_row_ids)
+            fragments = _attach_preserved_row_ids(
+                fragments, pa.chunked_array(row_id_chunks)
+            )
+            del row_id_chunks
         written.extend(fragments)
         updated_rows = replacement_table.num_rows
 
@@ -722,10 +785,10 @@ def _apply_task(
     ``bucket_refs`` are this task's bucket ObjectRefs from every plan task.
     They are nested inside a list on purpose so Ray does not resolve them on
     the driver -- this task fetches them here, i.e. the bytes move from the
-    plan node to this node directly. Buckets are materialized one at a time.
-    A fragment's matched rows can arrive from several plan chunks; offsets are
-    gathered across chunks, and each chunk's rows are written before the next
-    chunk is fetched.
+    plan node to this node directly.     Buckets are materialized one at a time. Match offsets are stored as packed
+    Arrow integers and released after that fragment's deletion file is written.
+    Stable row ids are not kept across buckets; each bucket supplies its own
+    ids when its replacement rows are written.
 
     For each owned fragment the task writes
     a new *deletion file* marking the matched rows dead
@@ -757,37 +820,42 @@ def _apply_task(
     fragment_by_id = {f.fragment_id: f for f in dataset.get_fragments()}
     uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
 
-    # Pass 1 keeps only integer identities and releases each Arrow payload
-    # before the next bucket is fetched. Pass 2 writes one bucket at a time.
-    # ``num_partitions`` shrinks that bucket; a hot fragment is still owned
-    # here, but its rows are not resident all at once.
-    row_ids_by_fragment: dict[int, list[int]] = collections.defaultdict(list)
-    offsets_by_fragment: dict[int, list[int]] = collections.defaultdict(list)
+    # Pass 1 keeps packed integer identities and releases each Arrow payload
+    # before the next bucket is fetched. Row-id buffers are dropped after the
+    # duplicate check. Offset buffers are dropped as each fragment is deleted.
+    # Pass 2 writes one bucket at a time and, for stable row ids, reads ids
+    # only from that bucket. ``num_partitions`` shrinks both the payload and
+    # the preserved-id buffer.
+    matches_by_fragment: dict[int, _FragmentMatchIds] = {}
     for ref in bucket_refs:
         payload = ray.get(ref)
         _collect_bucket_matches(
             payload,
             rowid_column,
             offset_column,
-            row_ids_by_fragment,
-            offsets_by_fragment,
+            matches_by_fragment,
         )
         del payload
 
+    for fragment_id, matches in matches_by_fragment.items():
+        matches.release_row_ids_after_duplicate_check(f"target fragment {fragment_id}")
+
     removed_fragment_ids: list[int] = []
     updated_fragments: list[bytes] = []
-    for fragment_id, row_ids in row_ids_by_fragment.items():
-        offsets = offsets_by_fragment[fragment_id]
-        _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
-        _raise_on_duplicate_rowids(offsets, f"target fragment {fragment_id} offsets")
+    for fragment_id, matches in matches_by_fragment.items():
+        offsets = matches.take_offsets_after_duplicate_check(
+            f"target fragment {fragment_id} offsets"
+        )
         # Mark the matched rows dead with a deletion file, addressed by the
         # physical offsets gathered in the plan phase. A key predicate would
         # force the delete to rescan and decode the fragment's key column.
         new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
+        del offsets
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)
         else:
             updated_fragments.append(pickle.dumps(new_meta))
+    matches_by_fragment.clear()
 
     new_fragments: list[bytes] = []
     updated_rows = 0
@@ -1007,27 +1075,32 @@ def _commit_update(
         raise exc
 
 
-def _attach_preserved_row_ids(fragments: list[Any], row_ids: list[int]) -> list[Any]:
+def _attach_preserved_row_ids(
+    fragments: list[Any], row_ids: pa.Array[Any] | pa.ChunkedArray[Any]
+) -> list[Any]:
     """Bind preserved ``_rowid`` values onto newly written fragments.
 
-    ``row_ids`` is a prefix of the concatenated replacement-then-insert
-    table: each fragment takes as many ids as it has physical rows, and a
-    trailing fragment may receive fewer ids than rows. Lance fills those
-    remaining rows with newly assigned ids at commit.
+    ``row_ids`` follows the replacement rows in this bucket. Each fragment
+    takes as many ids as it has physical rows, and a trailing fragment may
+    receive fewer ids than rows. Lance fills those remaining rows with newly
+    assigned ids at commit.
     """
     from lance.fragment import RowIdSequence
 
-    remaining = list(row_ids)
+    offset = 0
+    total = len(row_ids)
     for fragment in fragments:
-        if not remaining:
+        if offset >= total:
             break
-        take = min(fragment.physical_rows, len(remaining))
-        fragment.row_id_meta = RowIdSequence(remaining[:take]).to_inline_metadata()
-        remaining = remaining[take:]
-    if remaining:
+        take = min(int(fragment.physical_rows), total - offset)
+        fragment.row_id_meta = RowIdSequence(
+            row_ids.slice(offset, take)
+        ).to_inline_metadata()
+        offset += take
+    if offset != total:
         raise RuntimeError(
             "Internal error: leftover replacement row ids after attaching "
-            f"to fragments ({len(remaining)})"
+            f"to fragments ({total - offset})"
         )
     return fragments
 
@@ -1242,9 +1315,10 @@ def merge_into(
             ``num_workers``). Raise it to shrink each plan chunk without
             creating more apply tasks (e.g. ``num_partitions=32`` with
             ``num_workers=8``). Apply tasks stream those chunks one at a time,
-            so the same setting bounds each apply task's resident source data
-            by the largest chunk. A hot fragment stays on one owner; its rows
-            are written chunk by chunk.
+            so the same setting bounds each apply task's resident source rows
+            and preserved row ids by the largest chunk. Match offsets are
+            packed integers and are released when that fragment's deletion
+            file is written. A hot fragment stays on one owner.
         ray_remote_args: Options for the Ray tasks (e.g. ``num_cpus``,
             ``resources``).
 
