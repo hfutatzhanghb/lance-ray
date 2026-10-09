@@ -12,6 +12,7 @@ from typing import Any, Literal, Optional, TypeAlias, cast, get_args
 import lance
 import pyarrow as pa
 import ray
+from lance.bitmap import Bitmap
 from lance.dataset import Index, IndexConfig, LanceDataset
 from lance.indices import IndicesBuilder
 from packaging import version
@@ -289,9 +290,7 @@ def _handle_scalar_segment_index(
 
             segment_index = dataset.create_index_uncommitted(
                 column=column,
-                # pylance annotates this as ``str`` but accepts an
-                # ``IndexConfig`` too (see ``_prepare_scalar_index_request``).
-                index_type=index_type,  # type: ignore[arg-type]
+                index_type=index_type,
                 name=name,
                 replace=replace,
                 train=train,
@@ -785,7 +784,7 @@ def create_scalar_index(
         name=name,
         fields=fields,
         dataset_version=dataset.version,
-        fragment_ids=set(fragment_ids_to_use),
+        fragment_ids=Bitmap(fragment_ids_to_use),
         index_version=0,
     )
 
@@ -932,11 +931,9 @@ class _NestedVectorIndicesBuilder:
             fragment_ids,
             num_bits=num_bits,
         )
-        # ``train_pq_model`` is annotated as returning a generic ``pa.Array``
-        # upstream, but always produces a fixed-size-list codebook.
         return PqModel(
             num_subvectors,
-            cast("pa.FixedSizeListArray[Any]", codebook),
+            codebook,
             num_bits=num_bits,
         )
 

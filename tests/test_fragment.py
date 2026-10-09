@@ -10,7 +10,7 @@ import pyarrow as pa
 import pytest
 import ray
 from lance_ray.datasink import LanceDatasink, LanceFragmentCommitter
-from lance_ray.fragment import LanceFragmentWriter
+from lance_ray.fragment import LanceFragmentWriter, write_fragment
 
 
 def _legacy_write_fragments(
@@ -142,6 +142,102 @@ def test_target_bases_fail_fast_when_fragment_api_unsupported(
 
     with pytest.raises(RuntimeError, match="target_bases.*write_fragments"):
         lr.write_lance(cast(Any, object()), str(tmp_path), target_bases=target_bases)
+
+
+@pytest.mark.parametrize("target_all_bases", [True, False])
+def test_target_all_bases_fail_fast_when_fragment_api_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target_all_bases: bool,
+) -> None:
+    import lance.fragment as lance_fragment
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", _legacy_write_fragments)
+    uri = str(tmp_path)
+
+    with pytest.raises(RuntimeError, match="target_all_bases.*write_fragments"):
+        LanceFragmentWriter(
+            uri, data_storage_version="stable", target_all_bases=target_all_bases
+        )
+    with pytest.raises(RuntimeError, match="target_all_bases.*write_fragments"):
+        LanceDatasink(uri, target_all_bases=target_all_bases)
+    with pytest.raises(RuntimeError, match="target_all_bases.*write_fragments"):
+        lr.write_lance(cast(Any, object()), uri, target_all_bases=target_all_bases)
+    with pytest.raises(RuntimeError, match="target_all_bases.*write_fragments"):
+        write_fragment([pa.table({"id": [1]})], uri, target_all_bases=target_all_bases)
+
+
+@pytest.mark.parametrize("target_all_bases", [True, False])
+def test_target_bases_and_target_all_bases_are_mutually_exclusive(
+    tmp_path: Path, target_all_bases: bool
+) -> None:
+    uri = str(tmp_path)
+    target_bases = ["archive"]
+    match = "'target_bases' and 'target_all_bases' are mutually exclusive"
+
+    with pytest.raises(ValueError, match=match):
+        LanceFragmentWriter(
+            uri,
+            data_storage_version="stable",
+            target_bases=target_bases,
+            target_all_bases=target_all_bases,
+        )
+    with pytest.raises(ValueError, match=match):
+        LanceDatasink(uri, target_bases=target_bases, target_all_bases=target_all_bases)
+    for stream in [False, True]:
+        with pytest.raises(ValueError, match=match):
+            lr.write_lance(
+                cast(Any, object()),
+                uri,
+                target_bases=target_bases,
+                target_all_bases=target_all_bases,
+                stream=stream,
+            )
+    with pytest.raises(ValueError, match=match):
+        write_fragment(
+            [pa.table({"id": [1]})],
+            uri,
+            target_bases=target_bases,
+            target_all_bases=target_all_bases,
+        )
+
+
+@pytest.mark.parametrize("target_bases", [None, []])
+@pytest.mark.parametrize("target_all_bases", [None, True, False])
+def test_fragment_writer_target_all_bases_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target_bases: Optional[list[str]],
+    target_all_bases: Optional[bool],
+) -> None:
+    import lance.fragment as lance_fragment
+
+    omitted = object()
+    received: list[tuple[Optional[list[str]], object]] = []
+
+    def capture(
+        _reader: Any,
+        _uri: str,
+        *,
+        target_bases: Optional[list[str]] = None,
+        target_all_bases: object = omitted,
+        **_kwargs: Any,
+    ) -> list[Any]:
+        received.append((target_bases, target_all_bases))
+        return []
+
+    monkeypatch.setattr(lance_fragment, "write_fragments", capture)
+    writer = LanceFragmentWriter(
+        str(tmp_path),
+        data_storage_version="stable",
+        target_bases=target_bases,
+        target_all_bases=target_all_bases,
+    )
+    writer(pa.table({"id": [1]}))
+
+    assert len(received) == 1
+    assert received[0][0] == target_bases
+    assert received[0][1] is (omitted if target_all_bases is None else target_all_bases)
 
 
 def test_allow_external_blob_outside_bases_ignored_for_ingest(

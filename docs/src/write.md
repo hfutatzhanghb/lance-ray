@@ -12,6 +12,7 @@ write_lance(
     schema=None, 
     mode="create", 
     target_bases=None,
+    target_all_bases=None,
     **kwargs)
 ```
 
@@ -26,6 +27,7 @@ Write a Ray Dataset to Lance format.
 - `schema`: Optional PyArrow schema
 - `mode`: Write mode - "create", "append", or "overwrite"
 - `target_bases`: Optional list of registered base names or base path URIs where new data files should be written. In `create` mode, entries must match `initial_bases`; in `append` and `overwrite` modes, entries must match bases already registered in the dataset manifest
+- `target_all_bases`: Select all registered bases, including primary storage when `True` and excluding it when `False`. `False` requires at least one registered base. `None` (default) leaves base selection unchanged. Mutually exclusive with non-empty `target_bases`
 - `min_rows_per_file`: Minimum rows per file (default: 1024 * 1024)
 - `max_rows_per_file`: Maximum rows per file (default: 64 * 1024 * 1024)
 - `data_storage_version`: Optional data storage version
@@ -38,3 +40,19 @@ Write a Ray Dataset to Lance format.
 - `concurrency`: Optional maximum number of concurrent Ray tasks
 
 **Returns:** None
+
+### Blob storage formats
+
+`data_storage_version=None` uses PyLance's default stable format. Legacy blob
+columns declared with `lance-encoding:blob=true` field metadata are supported by
+file formats 2.0 and 2.1. When the version is omitted, `write_lance` rejects a
+legacy blob schema before dispatching the write. To write these columns,
+explicitly select a compatible format for both regular and streaming writes,
+for example:
+
+```python
+write_lance(ds, uri, data_storage_version="2.1")
+```
+
+To write blob columns in file formats 2.2 and later, use the Blob v2 extension
+type (`lance.blob.v2`), constructed with `lance.blob_field` and `lance.blob_array`.

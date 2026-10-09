@@ -18,6 +18,7 @@ import pandas as pd
 from _utils import (
     fragment_write_options_skip_reason,
     missing_fragment_write_options,
+    to_numpy_backed,
 )
 
 sys.path.insert(
@@ -291,7 +292,7 @@ class TestReadWrite:
 
         # Read it back
         read_dataset = lr.read_lance(str(path))
-        read_df = read_dataset.to_pandas()
+        read_df = read_dataset.to_pandas().pipe(to_numpy_backed)
 
         # Compare data (sort by id to ensure consistent order)
         original_sorted = sample_data.sort_values("id").reset_index(drop=True)
@@ -423,7 +424,7 @@ class TestNamespaceReadWrite:
             namespace_properties={"root": temp_dir},
             table_id=table_id,
         )
-        read_df = read_dataset.to_pandas()
+        read_df = read_dataset.to_pandas().pipe(to_numpy_backed)
 
         original_sorted = sample_data.sort_values("id").reset_index(drop=True)
         read_sorted = read_df.sort_values("id").reset_index(drop=True)
@@ -492,6 +493,54 @@ class TestMultiBaseLayout:
         will all carry ``id=0`` and trigger a Rust-level
         ``Duplicate base path ID 0`` error.
     """
+
+    @pytest.mark.skipif(
+        bool(missing_fragment_write_options("target_all_bases")),
+        reason=fragment_write_options_skip_reason("target_all_bases"),
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("target_all_bases", [True, False])
+    def test_target_all_bases_write_modes(
+        self, tmp_path: Path, stream: bool, target_all_bases: bool
+    ) -> None:
+        root = tmp_path / "dataset.lance"
+        bases = [tmp_path / "base_a", tmp_path / "base_b"]
+        for base in bases:
+            base.mkdir()
+        initial_bases = [
+            DatasetBasePath(path=base.as_uri(), name=base.name) for base in bases
+        ]
+        table = pa.table({"id": list(range(6))})
+        ray_ds = ray.data.from_arrow(table)
+        directories = [root / "data", *bases]
+
+        for mode in ("create", "append", "overwrite"):
+            before = [set(directory.rglob("*.lance")) for directory in directories]
+            lr.write_lance(
+                ray_ds,
+                str(root),
+                mode=mode,
+                initial_bases=initial_bases if mode == "create" else None,
+                target_all_bases=target_all_bases,
+                min_rows_per_file=1,
+                max_rows_per_file=1,
+                data_storage_version="stable",
+                stream=stream,
+                batch_size=3,
+            )
+            written = [
+                set(directory.rglob("*.lance")) - previous
+                for directory, previous in zip(directories, before, strict=True)
+            ]
+            assert bool(written[0]) is target_all_bases
+            assert written[1] and written[2]
+            dataset = lance.dataset(str(root))
+            expected_ids = list(range(6)) * (2 if mode == "append" else 1)
+            assert (
+                dataset.to_table()
+                .sort_by("id")
+                .equals(pa.table({"id": sorted(expected_ids)}))
+            )
 
     def test_multiple_initial_bases_without_explicit_id(self, temp_dir: str) -> None:
         """Multiple DatasetBasePath objects without explicit id should not collide.

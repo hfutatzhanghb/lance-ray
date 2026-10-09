@@ -171,6 +171,7 @@ def write_lance(
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     initial_bases: Optional[list[Any]] = None,
     target_bases: Optional[list[str]] = None,
+    target_all_bases: Optional[bool] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     namespace_impl: Optional[str] = None,
@@ -221,9 +222,9 @@ def write_lance(
         max_bytes_per_file: The maximum number of bytes per file. This is a soft
             limit. If not provided, the PyLance default is used.
         data_storage_version: The version of the data storage format to use. Newer versions are more
-            efficient but require newer versions of lance to read.  The default is
-            "legacy" which will use the legacy v1 version.  See the user guide
-            for more details.
+            efficient but require newer versions of lance to read. The default
+            (None) uses PyLance's stable format. Legacy blob columns require an
+            explicit compatible version such as "2.1".
         enable_stable_row_ids: Enable stable row IDs for the dataset and all
             fragments written by this operation. Default is False.
         storage_options: The storage options for the writer. Default is None.
@@ -237,6 +238,10 @@ def write_lance(
             from registered bases.  In CREATE mode, references must match
             bases in ``initial_bases``.  In APPEND/OVERWRITE modes,
             references must match bases in the existing manifest.
+        target_all_bases: Select all registered bases, including primary storage
+            when True and excluding it when False. None preserves the default.
+            Mutually exclusive with non-empty target_bases. Round-robin restarts
+            for each write task or streaming batch, not across the dataset.
         external_blob_mode: How external blob URIs are handled on write.
             ``"reference"`` stores external blob references, while ``"ingest"``
             reads external bytes and writes them into Lance-managed storage.
@@ -256,12 +261,20 @@ def write_lance(
         raise ValueError("'initial_bases' can only be used with mode='create'")
     allow_external_blob_outside_bases = prepare_fragment_write_options(
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
         stacklevel=2,
     )
     initial_bases = normalize_initial_bases(initial_bases)
+    if data_storage_version is None:
+        write_schema = schema
+        if write_schema is None:
+            ray_schema = ds.schema()
+            if ray_schema is not None and isinstance(ray_schema.base_schema, pa.Schema):
+                write_schema = ray_schema.base_schema
+        _validate_legacy_blob_storage_version(write_schema)
 
     # Fast path: non-streaming write using the Datasink API.
     if not stream:
@@ -279,6 +292,7 @@ def write_lance(
             base_store_params=base_store_params,
             initial_bases=initial_bases,
             target_bases=target_bases,
+            target_all_bases=target_all_bases,
             external_blob_mode=external_blob_mode,
             allow_external_blob_outside_bases=allow_external_blob_outside_bases,
             namespace_impl=namespace_impl,
@@ -379,6 +393,7 @@ def write_lance(
             base_store_params=base_store_params,
             initial_bases=fragment_initial_bases,
             target_bases=target_bases,
+            target_all_bases=target_all_bases,
             external_blob_mode=external_blob_mode,
             allow_external_blob_outside_bases=allow_external_blob_outside_bases,
             namespace_impl=None,
@@ -1208,4 +1223,27 @@ def _validate_write_args(
     if uri is None and not has_ns:
         raise ValueError(
             "Must provide either 'uri' OR ('namespace_impl' + 'table_id')."
+        )
+
+
+def _validate_legacy_blob_storage_version(schema: Optional[pa.Schema]) -> None:
+    if schema is None:
+        return
+
+    def legacy_blob_paths(field: "pa.Field[Any]", parent: str = "") -> list[str]:
+        path = f"{parent}.{field.name}" if parent else field.name
+        metadata = field.metadata or {}
+        paths = [path] if metadata.get(b"lance-encoding:blob") == b"true" else []
+        if pa.types.is_struct(field.type):
+            for child in field.type:
+                paths.extend(legacy_blob_paths(child, path))
+        return paths
+
+    paths = [path for field in schema for path in legacy_blob_paths(field)]
+    if paths:
+        fields = ", ".join(repr(path) for path in paths)
+        raise ValueError(
+            f"Legacy blob field(s) {fields} are incompatible with the default "
+            'stable data storage version. Set data_storage_version="2.1" to '
+            "keep using legacy blob encoding, or migrate the field(s) to Blob v2."
         )

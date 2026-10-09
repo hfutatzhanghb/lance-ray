@@ -106,12 +106,7 @@ def resolve_dataset_field_path(
     dataset: LanceDataset, path: str
 ) -> ResolvedDatasetFieldPath:
     resolved = resolve_arrow_field_path(dataset.schema, path)
-    # ``LanceSchema.field()`` exists on the Rust extension type but is missing
-    # from pylance's ``lance/lance/schema.pyi`` stub. It takes a dotted field
-    # path and returns ``Optional[LanceField]``.
-    lance_field: Optional[LanceField] = dataset.lance_schema.field(  # type: ignore[attr-defined]
-        resolved.path
-    )
+    lance_field: Optional[LanceField] = dataset.lance_schema.field(resolved.path)
     if lance_field is None:
         raise KeyError(f"Field path {path!r} not found in Lance schema")
     return ResolvedDatasetFieldPath(
