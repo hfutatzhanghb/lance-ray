@@ -185,6 +185,39 @@ def test_sql_literal_renders_common_scalars() -> None:
     assert _sql_literal(b"abc", pa.binary()) == "X'616263'"
 
 
+def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
+    """decimal128(38, *) must not inherit the default precision-28 context."""
+    from lance_ray.merge_into import _sql_literal
+
+    value = Decimal("1" * 36 + ".25")
+    assert _sql_literal(value, pa.decimal128(38, 2)) == (
+        "DECIMAL(38,2) '111111111111111111111111111111111111.25'"
+    )
+    wide = Decimal("9" * 40)
+    assert _sql_literal(wide, pa.decimal256(40, 0)) == f"DECIMAL(40,0) '{wide}'"
+
+
+def test_schema_field_ids_include_nested_leaves() -> None:
+    """Index maintenance needs leaf ids, not only top-level field ids."""
+    from lance.schema import LanceSchema
+    from lance_ray.merge_into import _schema_field_ids
+
+    arrow_schema = pa.schema(
+        [
+            ("id", pa.int64()),
+            ("meta", pa.struct([("text", pa.string())])),
+        ]
+    )
+    schema = LanceSchema.from_pyarrow(arrow_schema)
+    top_level = [field.id() for field in schema.fields()]
+    all_ids = _schema_field_ids(schema)
+    nested = schema.field("meta.text")
+    assert nested is not None
+    assert all_ids[: len(top_level)] == top_level
+    assert nested.id() in all_ids
+    assert nested.id() not in top_level
+
+
 @pytest.mark.parametrize(
     ("key_type", "ticks"),
     [
@@ -428,6 +461,61 @@ class TestMergeInto:
         assert after_ids[0] == before_ids[0]
         assert after_ids[19] == before_ids[19]
         assert after_ids[300] not in before_ids.values()
+
+    def test_stable_row_rewrite_does_not_reuse_nested_index(
+        self, temp_dir: str
+    ) -> None:
+        """A nested-field index must not cover rows rewritten with stable ids."""
+        path = Path(temp_dir) / "nested_index_stable"
+        meta_type = pa.struct([("text", pa.string())])
+        table = pa.table(
+            {
+                "id": [1, 2, 3, 4],
+                "meta": pa.array(
+                    [
+                        {"text": "old"},
+                        {"text": "keep"},
+                        {"text": "other"},
+                        {"text": "rest"},
+                    ],
+                    type=meta_type,
+                ),
+            }
+        )
+        dataset = lance.write_dataset(
+            table, str(path), max_rows_per_file=2, enable_stable_row_ids=True
+        )
+        dataset.create_scalar_index("meta.text", index_type="BTREE", name="meta_text")
+        before_ids = {fragment.fragment_id for fragment in dataset.get_fragments()}
+
+        source = pa.table(
+            {
+                "id": [1],
+                "meta": pa.array([{"text": "updated"}], type=meta_type),
+            }
+        )
+        updated = lr.merge_into(source, str(path), on="id", num_workers=1)
+        found = updated.to_table(filter="meta.text = 'updated'")
+        assert found.column("id").to_pylist() == [1]
+        assert updated.to_table(filter="meta.text = 'keep'").column(
+            "id"
+        ).to_pylist() == [2]
+
+        new_ids = {
+            fragment.fragment_id for fragment in updated.get_fragments()
+        } - before_ids
+        assert new_ids
+        index = next(
+            description
+            for description in updated.describe_indices()
+            if description.name == "meta_text"
+        )
+        covered = {
+            int(fragment_id)
+            for segment in index.segments
+            for fragment_id in segment.fragment_ids
+        }
+        assert new_ids.isdisjoint(covered)
 
     def test_target_one_to_many_updates_all_matches(self, temp_dir: str) -> None:
         """A source key that hits several target rows updates every match."""
@@ -1021,6 +1109,41 @@ class TestMergeIntoDedupe:
             )
         )
         assert values["alpha"] in {"first", "dup"}
+
+    def test_dedupe_collapses_keys_equal_only_after_cast(self, temp_dir: str) -> None:
+        """String keys that cast to the same integer are one join key."""
+        path = Path(temp_dir) / "dedupe_cast_keys"
+        lance.write_dataset(
+            pa.table({"id": pa.array([100], type=pa.int64()), "value": ["keep"]}),
+            str(path),
+        )
+        source = pa.table(
+            {
+                "id": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "1"],
+                "value": [
+                    "from_01",
+                    "v2",
+                    "v3",
+                    "v4",
+                    "v5",
+                    "v6",
+                    "v7",
+                    "v8",
+                    "v9",
+                    "from_1",
+                ],
+            }
+        )
+        updated = lr.merge_into(
+            source, str(path), on="id", num_workers=2, num_partitions=4
+        )
+        values = id_to_value(updated)
+        assert updated.count_rows() == 10
+        assert values[1] in {"from_01", "from_1"}
+        assert values[2] == "v2"
+        assert values[9] == "v9"
+        assert values[100] == "keep"
+        assert updated.to_table().column("id").to_pylist().count(1) == 1
 
 
 class TestMergeIntoMergeOnRead:

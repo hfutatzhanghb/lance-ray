@@ -11,12 +11,13 @@ source row with no match is inserted. The plan executes across Ray
 workers so that neither the source rows nor the rewritten fragments ever have
 to fit on the driver:
 
-0. DEDUPE (distributed): the source is range-partitioned with a
-   Ray Data sort on the join key -- all copies of a key land adjacent in
-   exactly one block -- and one arbitrary row per key is kept by dropping
-   adjacent duplicates per block. The sort also gives the plan phase
-   contiguous key slices, so each chunk's index lookups stay within few
-   BTREE leaf pages.
+0. DEDUPE (distributed): source rows are cast to the target schema first,
+   so key equality uses the type the lookup will see. The cast source is
+   then range-partitioned with a Ray Data sort on the join key -- all
+   copies of a key land adjacent in exactly one block -- and one arbitrary
+   row per key is kept by dropping adjacent duplicates per block. The sort
+   also gives the plan phase contiguous key slices, so each chunk's index
+   lookups stay within few BTREE leaf pages.
 1. PLAN (distributed): each plan task takes one source chunk and maps every
    join key to its target fragment id using batched ``key IN (...)`` lookups
    against the target dataset (``_rowaddr >> 32`` = fragment id; served by the
@@ -27,7 +28,9 @@ to fit on the driver:
    map-side shuffle). ``num_partitions`` only controls how many source
    chunks (plan tasks) run; it does not multiply the apply fan-out. The
    driver only receives small metadata; bucket bytes move from plan node to
-   apply node directly through the Ray object store.
+   apply node directly through the Ray object store. Apply tasks pull those
+   buckets one at a time, so a larger ``num_partitions`` also bounds each
+   apply task's resident source data.
 2. APPLY (distributed): each apply task owns a disjoint set of target
    fragments (guaranteed by the ownership function). Updates are
    merge-on-read: for every owned fragment the task writes a *deletion file*
@@ -63,7 +66,7 @@ import pickle
 import time
 import zlib
 from collections.abc import Callable, Iterator
-from decimal import Decimal
+from decimal import Context, Decimal, InvalidOperation, localcontext
 from functools import partial
 from typing import Any, Optional, Protocol, TypeVar
 
@@ -256,8 +259,16 @@ def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
     scale = int(arrow_type.scale)
     if not isinstance(value, Decimal):
         value = Decimal(str(value))
-    quantized = value.quantize(Decimal(1).scaleb(-scale))
-    return f"DECIMAL({precision},{scale}) '{quantized}'"
+    # The process-wide decimal context defaults to precision 28, which rejects
+    # legal decimal128 (up to 38 digits) and decimal256 keys.
+    with localcontext(Context(prec=max(precision, 1))):
+        try:
+            quantized = value.quantize(Decimal(1).scaleb(-scale))
+        except InvalidOperation as exc:
+            raise ValueError(
+                f"Decimal join key {value} does not fit DECIMAL({precision},{scale})"
+            ) from exc
+    return f"DECIMAL({precision},{scale}) '{format(quantized, 'f')}'"
 
 
 def _sql_binary_literal(value: Any) -> str:
@@ -320,6 +331,17 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
 def _chunked(seq: list[_T], n: int) -> Iterator[list[_T]]:
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
+
+
+def _align_source_batch(batch: Any, *, target_schema: pa.Schema, on: str) -> pa.Table:
+    """Cast one source batch to ``target_schema`` before the dedupe sort."""
+    if isinstance(batch, pa.RecordBatch):
+        batch = pa.Table.from_batches([batch])
+    if not isinstance(batch, pa.Table):
+        raise TypeError("Merge source batches must be Arrow tables")
+    if batch.num_rows == 0:
+        return pa.Table.from_batches([], schema=target_schema)
+    return _align_chunk(batch, target_schema, on)
 
 
 def _align_chunk(chunk: pa.Table, target_schema: pa.Schema, on: str) -> pa.Table:
@@ -605,6 +627,84 @@ def _plan_task(
         }
 
 
+def _collect_bucket_matches(
+    payload: dict[str, Any],
+    rowid_column: str,
+    offset_column: str,
+    row_ids_by_fragment: dict[int, list[int]],
+    offsets_by_fragment: dict[int, list[int]],
+) -> None:
+    """Record per-fragment row ids and physical offsets from one bucket."""
+    for fragment_id, table in payload["frags"].items():
+        row_ids_by_fragment[fragment_id].extend(
+            _integer_column_values(table.column(rowid_column))
+        )
+        offsets_by_fragment[fragment_id].extend(
+            _integer_column_values(table.column(offset_column))
+        )
+
+
+def _write_bucket(
+    payload: dict[str, Any],
+    uri: str,
+    storage_options: Optional[dict[str, Any]],
+    write_kwargs: dict[str, Any],
+    rowid_column: str,
+    offset_column: str,
+    *,
+    enable_stable_row_ids: bool,
+) -> tuple[list[Any], int, int]:
+    """Write one plan bucket and return ``(fragments, updated_rows, inserted_rows)``.
+
+    Replacement rows in this bucket are written before its inserts. Each
+    replacement fragment carries only the logical ids of the rows it holds,
+    so inserts do not have to be a suffix of one combined table.
+    """
+    replacement_parts: list[pa.Table] = []
+    replacement_row_ids: list[int] = []
+    for table in payload["frags"].values():
+        replacement_row_ids.extend(_integer_column_values(table.column(rowid_column)))
+        replacement_parts.append(table.drop_columns([rowid_column, offset_column]))
+
+    written: list[Any] = []
+    updated_rows = 0
+    if replacement_parts:
+        replacement_table = (
+            replacement_parts[0]
+            if len(replacement_parts) == 1
+            else pa.concat_tables(replacement_parts)
+        )
+        fragments = _write_append_fragments(
+            replacement_table,
+            uri,
+            storage_options,
+            write_kwargs,
+            enable_stable_row_ids=enable_stable_row_ids,
+        )
+        if enable_stable_row_ids:
+            fragments = _attach_preserved_row_ids(fragments, replacement_row_ids)
+        written.extend(fragments)
+        updated_rows = replacement_table.num_rows
+
+    inserted_rows = 0
+    inserts = payload["inserts"]
+    if inserts is not None and inserts.num_rows:
+        # Insert rows carry no useful rowid (-1); strip the helper column so
+        # the appended rows match the target schema. Commit assigns new ids.
+        insert_table = inserts.drop_columns([rowid_column])
+        written.extend(
+            _write_append_fragments(
+                insert_table,
+                uri,
+                storage_options,
+                write_kwargs,
+                enable_stable_row_ids=enable_stable_row_ids,
+            )
+        )
+        inserted_rows = insert_table.num_rows
+    return written, updated_rows, inserted_rows
+
+
 @ray.remote
 def _apply_task(
     task_id: int,
@@ -622,8 +722,10 @@ def _apply_task(
     ``bucket_refs`` are this task's bucket ObjectRefs from every plan task.
     They are nested inside a list on purpose so Ray does not resolve them on
     the driver -- this task fetches them here, i.e. the bytes move from the
-    plan node to this node directly. A fragment's matched rows can arrive from
-    several plan chunks, so per-fragment sub-tables are concatenated first.
+    plan node to this node directly. Buckets are materialized one at a time.
+    A fragment's matched rows can arrive from several plan chunks; offsets are
+    gathered across chunks, and each chunk's rows are written before the next
+    chunk is fetched.
 
     For each owned fragment the task writes
     a new *deletion file* marking the matched rows dead
@@ -639,7 +741,6 @@ def _apply_task(
     fragments it wrote.
     """
     t0 = time.perf_counter()
-    payloads = ray.get(bucket_refs)
     namespace_kwargs = get_namespace_kwargs(
         namespace_impl, namespace_properties, table_id
     )
@@ -654,61 +755,58 @@ def _apply_task(
     )
     rowid_column, offset_column = _helper_column_names(dataset.schema)
     fragment_by_id = {f.fragment_id: f for f in dataset.get_fragments()}
+    uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
 
-    tables_by_fragment: dict[int, list[pa.Table]] = collections.defaultdict(list)
-    insert_parts: list[pa.Table] = []
-    for payload in payloads:
-        for fragment_id, table in payload["frags"].items():
-            tables_by_fragment[fragment_id].append(table)
-        if payload["inserts"] is not None and payload["inserts"].num_rows:
-            # Insert rows carry no useful rowid (-1); strip the helper
-            # column so the appended rows match the target schema.
-            insert_parts.append(payload["inserts"].drop_columns([rowid_column]))
+    # Pass 1 keeps only integer identities and releases each Arrow payload
+    # before the next bucket is fetched. Pass 2 writes one bucket at a time.
+    # ``num_partitions`` shrinks that bucket; a hot fragment is still owned
+    # here, but its rows are not resident all at once.
+    row_ids_by_fragment: dict[int, list[int]] = collections.defaultdict(list)
+    offsets_by_fragment: dict[int, list[int]] = collections.defaultdict(list)
+    for ref in bucket_refs:
+        payload = ray.get(ref)
+        _collect_bucket_matches(
+            payload,
+            rowid_column,
+            offset_column,
+            row_ids_by_fragment,
+            offsets_by_fragment,
+        )
+        del payload
 
     removed_fragment_ids: list[int] = []
     updated_fragments: list[bytes] = []
-    replacement_parts: list[pa.Table] = []
-    replacement_row_ids: list[int] = []
-    updated_rows = 0
-    for fragment_id in tables_by_fragment:
-        source_rows = pa.concat_tables(tables_by_fragment[fragment_id])
+    for fragment_id, row_ids in row_ids_by_fragment.items():
+        offsets = offsets_by_fragment[fragment_id]
+        _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
+        _raise_on_duplicate_rowids(offsets, f"target fragment {fragment_id} offsets")
         # Mark the matched rows dead with a deletion file, addressed by the
         # physical offsets gathered in the plan phase. A key predicate would
         # force the delete to rescan and decode the fragment's key column.
-        # Join-all may place the same source key on this fragment more than
-        # once (one copy per matching target row).
-        row_ids = _integer_column_values(source_rows.column(rowid_column))
-        offsets = _integer_column_values(source_rows.column(offset_column))
-        _raise_on_duplicate_rowids(row_ids, f"target fragment {fragment_id}")
-        _raise_on_duplicate_rowids(offsets, f"target fragment {fragment_id} offsets")
-        source_rows = source_rows.drop_columns([rowid_column, offset_column])
         new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)
         else:
             updated_fragments.append(pickle.dumps(new_meta))
-        replacement_parts.append(source_rows)
-        replacement_row_ids.extend(row_ids)
-        updated_rows += source_rows.num_rows
 
-    inserted_rows = sum(t.num_rows for t in insert_parts)
     new_fragments: list[bytes] = []
-    append_parts = replacement_parts + insert_parts
-    uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
-    if append_parts:
-        # Replacements are written first so a prefix RowIdSequence can bind
-        # matched logical ids; commit assigns new ids to any trailing inserts.
-        append_table = pa.concat_tables(append_parts)
-        fragments = _write_append_fragments(
-            append_table,
+    updated_rows = 0
+    inserted_rows = 0
+    for ref in bucket_refs:
+        payload = ray.get(ref)
+        written, bucket_updated, bucket_inserted = _write_bucket(
+            payload,
             uri,
             storage_options,
             write_kwargs,
+            rowid_column,
+            offset_column,
             enable_stable_row_ids=uses_stable_row_ids,
         )
-        if uses_stable_row_ids and replacement_row_ids:
-            fragments = _attach_preserved_row_ids(fragments, replacement_row_ids)
-        new_fragments.extend(pickle.dumps(f) for f in fragments)
+        del payload
+        new_fragments.extend(pickle.dumps(fragment) for fragment in written)
+        updated_rows += bucket_updated
+        inserted_rows += bucket_inserted
 
     return {
         "label": f"apply-{task_id}",
@@ -957,6 +1055,27 @@ def _write_append_fragments(
     return fragments
 
 
+def _schema_field_ids(schema: Any) -> list[int]:
+    """Return every Lance field id, parents before their children.
+
+    ``LanceOperation.Update.fields_for_preserving_frag_bitmap`` is the set of
+    fields whose values moved. An index is left stale for a rewritten fragment
+    when its field id is in that set. Scalar and vector indexes on nested
+    columns store the leaf id, so a top-level-only list lets those indexes
+    treat the new fragment as already indexed and filter queries miss the
+    updated rows. This walk matches Lance ``Schema::fields_pre_order``.
+    """
+    field_ids: list[int] = []
+
+    def walk(fields: list[Any]) -> None:
+        for field in fields:
+            field_ids.append(int(field.id()))
+            walk(field.children())
+
+    walk(schema.fields())
+    return field_ids
+
+
 def _has_scalar_index_on(dataset: lance.LanceDataset, column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
@@ -980,15 +1099,21 @@ def _has_scalar_index_on(dataset: lance.LanceDataset, column: str) -> bool:
 
 
 def _source_to_chunk_refs(
-    source: ray.data.Dataset | pa.Table, on: str, num_partitions: int
+    source: ray.data.Dataset | pa.Table,
+    on: str,
+    num_partitions: int,
+    target_schema: pa.Schema,
 ) -> list[ray.ObjectRef[pa.Table]]:
-    """Sort-dedupe the source on the join key; return Arrow-table ObjectRefs.
+    """Cast, then sort-dedupe the source; return Arrow-table ObjectRefs.
 
-    The source is range-partitioned with a Ray Data sort on the key: all
-    copies of a key land adjacent in exactly one block, so dropping adjacent
-    duplicates per block is a complete global dedupe (one arbitrary row per
-    key survives). The sort also hands the plan phase contiguous key slices,
-    which keeps each chunk's index lookups within few BTREE leaf pages.
+    The cast happens before the sort so keys that become equal only after
+    conversion to the target type (string ``"01"`` and ``"1"`` against an
+    integer column) are one key for the global dedupe. The source is then
+    range-partitioned with a Ray Data sort on that key: all copies land
+    adjacent in exactly one block, so dropping adjacent duplicates per block
+    is a complete global dedupe (one arbitrary row per key survives). The
+    sort also hands the plan phase contiguous key slices, which keeps each
+    chunk's index lookups within few BTREE leaf pages.
     """
     if isinstance(source, pa.Table):
         if source.num_rows == 0:
@@ -999,6 +1124,11 @@ def _source_to_chunk_refs(
             "source must be a ray.data.Dataset or a pyarrow.Table, got "
             f"{type(source).__name__}"
         )
+    source = source.map_batches(
+        partial(_align_source_batch, target_schema=target_schema, on=on),
+        batch_size=None,
+        batch_format="pyarrow",
+    )
     sort_column = None
     source_schema = source.schema()
     if source_schema is not None and isinstance(source_schema.base_schema, pa.Schema):
@@ -1084,9 +1214,9 @@ def merge_into(
             ``ray.data.Dataset`` or an in-memory ``pyarrow.Table``. The
             source must contain every column of the target schema (columns
             are reordered/cast as needed) and must not contain null join
-            keys. Duplicate join keys are deduplicated, keeping one
-            arbitrary occurrence per key (which copy survives is
-            unspecified).
+            keys. Duplicate join keys are deduplicated after that cast,
+            keeping one arbitrary occurrence per target-typed key (which
+            copy survives is unspecified).
         uri: The URI of the target Lance dataset. Either ``uri`` OR
             (``namespace_impl`` + ``table_id``) must be provided.
         on: The join key column name. Supported types are boolean, integer,
@@ -1107,11 +1237,14 @@ def merge_into(
         num_workers: Maximum number of Ray tasks running concurrently in each
             phase, and the number of apply-side fragment owners (default: 4).
             Fragment ownership is ``crc32(fragment_id) % num_workers``. Lower
-            it to reduce peak memory, IO, and shuffle fan-out.
+            it to reduce concurrent IO and shuffle fan-out.
         num_partitions: Number of source chunks in the plan phase (default:
-            ``num_workers``). Raise it to make each plan task smaller without
-            creating more apply tasks or a quadratic number of Ray objects
-            (e.g. ``num_partitions=32`` with ``num_workers=8``).
+            ``num_workers``). Raise it to shrink each plan chunk without
+            creating more apply tasks (e.g. ``num_partitions=32`` with
+            ``num_workers=8``). Apply tasks stream those chunks one at a time,
+            so the same setting bounds each apply task's resident source data
+            by the largest chunk. A hot fragment stays on one owner; its rows
+            are written chunk by chunk.
         ray_remote_args: Options for the Ray tasks (e.g. ``num_cpus``,
             ``resources``).
 
@@ -1159,7 +1292,10 @@ def merge_into(
     )
     read_version = dataset.version
     target_schema = dataset.schema
-    field_ids = [field.id() for field in dataset.lance_schema.fields()]
+    # Full-row rewrites change every column, including nested leaves. Pass
+    # the whole id tree so stable-row-id commits do not extend a nested
+    # index's fragment bitmap over the rewritten fragment.
+    field_ids = _schema_field_ids(dataset.lance_schema)
     if on not in target_schema.names:
         raise ValueError(
             f"Join key column {on!r} not found in target schema {target_schema.names}"
@@ -1173,10 +1309,10 @@ def merge_into(
             on,
         )
 
-    # Phase 0: sort-based dedupe. The deduplicated, range-partitioned blocks
-    # become the plan chunks; every downstream duplicate check then passes
-    # by construction.
-    chunk_refs = _source_to_chunk_refs(ds, on, num_partitions)
+    # Phase 0: cast to the target schema, then sort-dedupe. The deduplicated,
+    # range-partitioned blocks become the plan chunks; every downstream
+    # duplicate check then passes by construction.
+    chunk_refs = _source_to_chunk_refs(ds, on, num_partitions, target_schema)
 
     # Phase 1: PLAN + map-side shuffle. Chunk refs are passed as top-level
     # args (resolved on the worker). Each plan task yields one object per

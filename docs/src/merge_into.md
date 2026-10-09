@@ -7,7 +7,7 @@ The whole operation commits as a **single atomic version** — readers see eithe
 ## How it works
 
 1. **Plan (distributed):** the source is split into `num_partitions` chunks; each Ray task maps its keys to their target fragments using batched index lookups on the join key column, then routes rows to `num_workers` per-owner buckets keyed by target fragment. Only non-empty buckets are materialized. The driver only handles object references and small metadata — source rows never pass through it.
-2. **Apply (distributed):** each Ray task owns a disjoint set of target fragments. Updates are merge-on-read: the task masks the matched rows of every owned fragment with a deletion vector written from local physical offsets (`LanceFragment.delete_rows`; fragment data files are never rewritten), and appends the replacement values together with unmatched rows as new fragments. On datasets with stable row IDs, replacement fragments keep the matched rows' logical `_rowid` values; inserts receive newly assigned IDs. Scans filter through the deletion vectors until the next compaction folds them away.
+2. **Apply (distributed):** each Ray task owns a disjoint set of target fragments and streams its plan buckets one at a time. Updates are merge-on-read: the task masks the matched rows of every owned fragment with a deletion vector written from local physical offsets (`LanceFragment.delete_rows`; fragment data files are never rewritten), and appends the replacement values together with unmatched rows as new fragments. On datasets with stable row IDs, replacement fragments keep the matched rows' logical `_rowid` values; inserts receive newly assigned IDs. Scans filter through the deletion vectors until the next compaction folds them away. Full-row rewrites mark every field, including nested leaves, so an existing index on a nested column is not reused for the rewritten fragment.
 3. **Commit (driver):** all per-task results are unioned into one `lance.LanceOperation.Update` and committed once. Concurrent appends are rebased inside `LanceDataset.commit`. If that call raises after the write is already in the latest manifest, `merge_into` still returns that dataset.
 
 ## `merge_into`
@@ -32,21 +32,21 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 
 **Parameters:**
 
-- `ds`: The source rows, as a `ray.data.Dataset` or a `pyarrow.Table`. The source must contain every column of the target schema (columns are reordered/cast as needed) and must not contain null join keys. Duplicate join keys are deduplicated, keeping one arbitrary occurrence per key (which copy survives is unspecified).
+- `ds`: The source rows, as a `ray.data.Dataset` or a `pyarrow.Table`. The source must contain every column of the target schema (columns are reordered/cast as needed) and must not contain null join keys. Duplicate join keys are deduplicated after that cast, keeping one arbitrary occurrence per target-typed key (which copy survives is unspecified).
 - `uri`: Target dataset URI (either `uri` OR `namespace_impl` + `table_id` required)
 - `on`: Join key column name (required, keyword-only). Supported scalar types: boolean, integer, floating, string, date, timestamp, time, decimal, and binary (including dictionary-encoded scalars). Nested types such as list or struct are rejected on the driver before any Ray task starts. A scalar index on this column is strongly recommended for large targets (the plan phase falls back to filtered scans without one). Every matching target row is updated (join-all, same as pylance `merge_insert`).
 - `table_id`: Table identifier as a list of strings (requires `namespace_impl`)
 - `namespace_impl`: Namespace implementation type (e.g., `"rest"`, `"dir"`)
 - `namespace_properties`: Properties for connecting to the namespace
 - `storage_options`: Optional storage configuration dictionary
-- `num_workers`: Concurrent Ray tasks per phase **and** the number of apply-side fragment owners (default: 4). Ownership is `crc32(fragment_id) % num_workers`. Lower it to reduce peak memory, IO, and shuffle fan-out.
-- `num_partitions`: Number of source chunks for the plan phase only (default: `num_workers`). Raise this to shrink each plan task without creating more apply workers or a quadratic number of Ray objects.
+- `num_workers`: Concurrent Ray tasks per phase **and** the number of apply-side fragment owners (default: 4). Ownership is `crc32(fragment_id) % num_workers`. Lower it to reduce concurrent IO and shuffle fan-out.
+- `num_partitions`: Number of source chunks for the plan phase only (default: `num_workers`). Raise this to shrink each plan chunk without creating more apply workers. Apply tasks stream those chunks one at a time, so the same setting also bounds each apply task's resident source data by the largest chunk. A hot fragment stays on one owner; its rows are written chunk by chunk.
 - `ray_remote_args`: Optional kwargs for Ray remote tasks (e.g., `num_cpus`)
 
 ## Best practices
 
 - Size **`num_workers`** to the cluster slots you want busy during plan and apply (typically 8–64). This is also apply parallelism: each worker owns a disjoint subset of target fragments.
-- Raise **`num_partitions` above `num_workers`** when plan tasks are memory-heavy (large source chunks or expensive index probes). Example: `num_workers=8`, `num_partitions=32` runs 32 smaller plan tasks with at most 8 in flight, and still only 8 apply owners. Plan tasks yield only non-empty owner buckets, so empty plan→apply edges are not stored as Ray objects.
+- Raise **`num_partitions` above `num_workers`** when plan or apply tasks are memory-heavy (large source chunks or expensive index probes). Example: `num_workers=8`, `num_partitions=32` runs 32 smaller plan tasks with at most 8 in flight, and still only 8 apply owners. Each apply owner pulls one bucket at a time, so its resident source data follows the largest chunk. Plan tasks yield only non-empty owner buckets, so empty plan→apply edges are not stored as Ray objects.
 - Do **not** set `num_partitions` in the hundreds or thousands expecting more apply workers. Apply fan-out follows `num_workers`. A large `num_partitions` only increases how many plan tasks run.
 - Create a scalar index (e.g. BTREE) on the join key before merging into large tables so planning is index lookups instead of filtered scans.
 - Join on a scalar column. Dates, timestamps, times, decimals, and binary keys are encoded as Lance SQL literals in the plan phase. Timestamp and time keys retain their Arrow precision, including nanoseconds; timestamp keys also retain their timezone. List, struct, and other nested types fail immediately from the target schema — they do not wait for a remote plan task.
