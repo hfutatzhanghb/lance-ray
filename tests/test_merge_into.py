@@ -249,6 +249,60 @@ def test_fragment_match_ids_stay_packed_and_release() -> None:
         duplicate.release_row_ids_after_duplicate_check("fragment 1")
 
 
+def test_fragment_match_ids_drop_parent_bucket_buffers() -> None:
+    """Cross-bucket identities must not keep the deserialized bucket allocation."""
+    import sys
+
+    import numpy as np
+    from lance_ray.merge_into import _FragmentMatchIds
+
+    n = 100_000
+    parent = pa.table(
+        {
+            "payload": pa.array(["x" * 10] * n),
+            "rowid": pa.array(range(n), type=pa.uint64()),
+            "offset": pa.array(range(n), type=pa.int64()),
+        }
+    )
+    view = parent.slice(5, 2)
+    row_buf = view.column("rowid").chunk(0).buffers()[1]
+    offset_buf = view.column("offset").chunk(0).buffers()[1]
+    assert row_buf is not None and offset_buf is not None
+    assert row_buf.size > view.column("rowid").nbytes
+    assert offset_buf.size > view.column("offset").nbytes
+    row_refs = sys.getrefcount(row_buf)
+    offset_refs = sys.getrefcount(offset_buf)
+
+    matches = _FragmentMatchIds()
+    matches.append(view.column("rowid"), view.column("offset"))
+
+    assert sys.getrefcount(row_buf) == row_refs
+    assert sys.getrefcount(offset_buf) == offset_refs
+    assert matches.row_ids[0].to_pylist() == [5, 6]
+    assert matches.offsets[0].to_pylist() == [5, 6]
+    for stored in (*matches.row_ids, *matches.offsets):
+        data = stored.buffers()[1]
+        assert data is not None
+        assert data.size == stored.nbytes
+        assert data.address != row_buf.address
+        assert data.address != offset_buf.address
+
+    root = pa.allocate_buffer(1 << 20)
+    memory = np.ndarray(shape=(1,), dtype=np.int64, buffer=memoryview(root))
+    memory[0] = 42
+    shared = pa.Array.from_buffers(pa.int64(), 1, [None, root])
+    assert shared.nbytes == 8
+    assert shared.buffers()[1].size == root.size
+    root_refs = sys.getrefcount(root)
+    matches.append(shared, shared)
+    assert sys.getrefcount(root) == root_refs
+    assert matches.offsets[1].to_pylist() == [42]
+    stored_root = matches.offsets[1].buffers()[1]
+    assert stored_root is not None
+    assert stored_root.size == 8
+    assert stored_root.address != root.address
+
+
 def test_schema_field_ids_include_nested_leaves() -> None:
     """Index maintenance needs leaf ids, not only top-level field ids."""
     from lance.schema import LanceSchema

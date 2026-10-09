@@ -387,11 +387,13 @@ def _raise_if_duplicate_integers(chunks: list[pa.Array[Any]], context: str) -> N
 class _FragmentMatchIds:
     """Packed integer identities for one target fragment.
 
-    Row ids and offsets stay in Arrow buffers (about eight bytes each) instead
-    of Python lists. Row ids are released after the duplicate check. Offsets
-    are handed to ``delete_rows`` and then released, before any replacement
-    bucket is written. Preserved stable row ids are read later from the single
-    bucket being written.
+    Row ids and offsets are copied into compact Arrow buffers (about eight
+    bytes each). A sliced or deserialized source column often aliases the
+    whole bucket allocation; the copy lets that bucket be released while the
+    identities are still stored. Row ids are released after the duplicate
+    check. Offsets are handed to ``delete_rows`` and then released, before
+    any replacement bucket is written. Preserved stable row ids are read
+    later from the single bucket being written.
     """
 
     __slots__ = ("row_ids", "offsets")
@@ -405,8 +407,8 @@ class _FragmentMatchIds:
         row_ids: pa.Array[Any] | pa.ChunkedArray[Any],
         offsets: pa.Array[Any] | pa.ChunkedArray[Any],
     ) -> None:
-        self.row_ids.extend(_integer_chunks(row_ids))
-        self.offsets.extend(_integer_chunks(offsets))
+        self.row_ids.append(_owned_integer_array(row_ids))
+        self.offsets.append(_owned_integer_array(offsets))
 
     def release_row_ids_after_duplicate_check(self, context: str) -> None:
         _raise_if_duplicate_integers(self.row_ids, context)
@@ -446,6 +448,32 @@ def _integer_chunks(
     if null_count or not pa.types.is_integer(column_type):
         raise TypeError("Merge row identities must be non-null integers")
     return chunks
+
+
+def _owned_integer_array(
+    column: pa.Array[Any] | pa.ChunkedArray[Any],
+) -> pa.Array[Any]:
+    """Copy integer identities into a buffer that does not alias ``column``.
+
+    ``to_numpy(zero_copy_only=False)`` still returns a view when the values
+    are contiguous inside a larger parent buffer. ``ndarray.copy()`` allocates
+    storage that dies with this array, so dropping the source bucket can free
+    the rest of that buffer.
+    """
+    if isinstance(column, pa.Array):
+        null_count = column.null_count
+        column_type = column.type
+    else:
+        null_count = column.null_count
+        column_type = column.type
+    if null_count or not pa.types.is_integer(column_type):
+        raise TypeError("Merge row identities must be non-null integers")
+    if len(column) == 0:
+        return pa.array([], type=column_type)
+    values = column.to_numpy(zero_copy_only=False).copy()
+    owned = pa.array(values, type=column_type)
+    del values
+    return owned
 
 
 def _with_rowid_column(
