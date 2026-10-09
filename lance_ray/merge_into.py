@@ -419,6 +419,18 @@ class _FragmentMatchIds:
         return offsets
 
 
+def _offsets_for_delete_rows(offsets: pa.ChunkedArray[Any]) -> Any:
+    """Return offsets that ``LanceFragment.delete_rows`` can pass to ``int()``.
+
+    ``delete_rows`` does ``[int(o) for o in offsets]``. Iterating a ChunkedArray
+    yields ``Int64Scalar``, and some PyArrow builds reject ``int()`` on that
+    scalar. A NumPy buffer keeps the values packed until that one call.
+    """
+    if len(offsets) == 0:
+        return []
+    return offsets.combine_chunks().to_numpy(zero_copy_only=False)
+
+
 def _integer_chunks(
     column: pa.Array[Any] | pa.ChunkedArray[Any],
 ) -> list[pa.Array[Any]]:
@@ -849,8 +861,10 @@ def _apply_task(
         # Mark the matched rows dead with a deletion file, addressed by the
         # physical offsets gathered in the plan phase. A key predicate would
         # force the delete to rescan and decode the fragment's key column.
-        new_meta = fragment_by_id[fragment_id].delete_rows(offsets)
+        delete_offsets = _offsets_for_delete_rows(offsets)
         del offsets
+        new_meta = fragment_by_id[fragment_id].delete_rows(delete_offsets)
+        del delete_offsets
         if new_meta is None:
             removed_fragment_ids.append(fragment_id)
         else:

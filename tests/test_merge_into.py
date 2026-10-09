@@ -197,6 +197,21 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
     assert _sql_literal(wide, pa.decimal256(40, 0)) == f"DECIMAL(40,0) '{wide}'"
 
 
+def test_delete_offsets_are_real_numbers() -> None:
+    """delete_rows does int(offset); Arrow scalars are not accepted everywhere."""
+    from lance_ray.merge_into import _offsets_for_delete_rows
+
+    offsets = pa.chunked_array(
+        [
+            pa.array([3], type=pa.int64()),
+            pa.array([1], type=pa.int64()),
+        ]
+    )
+    values = _offsets_for_delete_rows(offsets)
+    assert [int(value) for value in values] == [3, 1]
+    assert not isinstance(values[0], pa.Scalar)
+
+
 def test_fragment_match_ids_stay_packed_and_release() -> None:
     """Row ids and offsets must not accumulate as Python lists or sets."""
     import tracemalloc
