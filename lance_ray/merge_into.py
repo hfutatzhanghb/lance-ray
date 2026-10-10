@@ -285,12 +285,14 @@ def _decimal_type_name(arrow_type: pa.DataType, precision: int, scale: int) -> s
 def _sql_negative_scale_decimal(
     quantized: Decimal, arrow_type: pa.DataType, precision: int, scale: int
 ) -> str:
-    """Render ``coefficient * 10**(-scale)`` cast back to the original type.
+    """Render a negative-scale decimal without widening the coefficient.
 
-    Lance cannot cast a string onto a decimal with a negative scale, and a
-    bare numeric literal of the scaled value is parsed as Float64 once it no
-    longer fits in an integer token. The coefficient fits in ``precision``
-    digits. Multiplying by an exact power of ten reconstructs the value.
+    Lance cannot cast a string onto a negative scale, and a bare number is
+    parsed as Float64 once it no longer fits in an integer token. Multiplying
+    the coefficient by a scale-0 power of ten overflows a full-precision
+    ``decimal128(38, -2)`` or ``decimal256(76, -2)`` before the final cast.
+    The power of ten is therefore a precision-1 decimal at the same negative
+    scale (coefficient 1). The product coefficient stays inside ``precision``.
     """
     coefficient = format(quantized.scaleb(scale), "f")
     power = -scale
@@ -301,18 +303,18 @@ def _sql_negative_scale_decimal(
             f"Decimal join key scale {scale} needs a {power_digits}-digit power "
             "of ten, which does not fit in Decimal256"
         )
-    power_name = (
-        f"Decimal256({power_digits}, 0)"
-        if power_digits > 38
-        else f"Decimal128({power_digits}, 0)"
-    )
+    power_family = "Decimal256" if power_digits > 38 else "Decimal128"
     coefficient_literal = (
         f"arrow_cast({_sql_string_literal(coefficient)}, "
         f"{_sql_string_literal(_decimal_type_name(arrow_type, precision, 0))})"
     )
-    power_literal = (
+    power_scale0 = (
         f"arrow_cast({_sql_string_literal(power_text)}, "
-        f"{_sql_string_literal(power_name)})"
+        f"{_sql_string_literal(f'{power_family}({power_digits}, 0)')})"
+    )
+    power_literal = (
+        f"arrow_cast({power_scale0}, "
+        f"{_sql_string_literal(_decimal_type_name(arrow_type, 1, scale))})"
     )
     target_name = _decimal_type_name(arrow_type, precision, scale)
     return (

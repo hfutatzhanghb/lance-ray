@@ -217,7 +217,18 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
     )
     assert _sql_literal(Decimal("100"), pa.decimal128(3, -2)) == (
         "arrow_cast(arrow_cast('1', 'Decimal128(3, 0)') * "
-        "arrow_cast('100', 'Decimal128(3, 0)'), 'Decimal128(3, -2)')"
+        "arrow_cast(arrow_cast('100', 'Decimal128(3, 0)'), 'Decimal128(1, -2)'), "
+        "'Decimal128(3, -2)')"
+    )
+    from decimal import Context, localcontext
+
+    with localcontext(Context(prec=42)):
+        full = Decimal(10) ** 39
+    rendered = _sql_literal(full, pa.decimal128(38, -2))
+    assert rendered == (
+        "arrow_cast(arrow_cast('10000000000000000000000000000000000000', "
+        "'Decimal128(38, 0)') * arrow_cast(arrow_cast('100', 'Decimal128(3, 0)'), "
+        "'Decimal128(1, -2)'), 'Decimal128(38, -2)')"
     )
 
 
@@ -882,6 +893,67 @@ class TestMergeInto:
             assert rows[inserted_key] == "inserted"
             assert len(rows) == 3
             assert merged.schema.field("amount").type == decimal_type
+
+    @pytest.mark.parametrize("with_index", [False, True])
+    @pytest.mark.parametrize(
+        "decimal_type",
+        [pa.decimal128(38, -2), pa.decimal256(76, -2)],
+    )
+    def test_full_precision_negative_scale_decimal(
+        self, temp_dir: str, with_index: bool, decimal_type: pa.DataType
+    ) -> None:
+        """A full-precision coefficient must not overflow before the lookup cast."""
+        from decimal import Context, localcontext
+
+        if not pa.types.is_decimal(decimal_type):
+            raise AssertionError(f"expected a decimal type, got {decimal_type}")
+        precision = int(decimal_type.precision)
+        with localcontext(Context(prec=precision + 4)):
+            kept_coeff = Decimal(1)
+            updated_coeff = Decimal(10) ** (precision - 1)
+            inserted_coeff = Decimal(2)
+            kept = kept_coeff * 100
+            updated_key = updated_coeff * 100
+            inserted_key = inserted_coeff * 100
+        scale0 = (
+            pa.decimal256(precision, 0)
+            if pa.types.is_decimal256(decimal_type)
+            else pa.decimal128(precision, 0)
+        )
+
+        def as_stored(coefficients: list[Decimal]) -> Any:
+            encoded = pa.array(coefficients, type=scale0)
+            return pa.Array.from_buffers(decimal_type, len(encoded), encoded.buffers())
+
+        path = str(Path(temp_dir) / f"full_neg_{precision}_{with_index}")
+        lance.write_dataset(
+            pa.table(
+                {
+                    "amount": as_stored([kept_coeff, updated_coeff]),
+                    "value": ["keep", "old"],
+                }
+            ),
+            path,
+        )
+        if with_index:
+            lance.dataset(path).create_scalar_index("amount", index_type="BTREE")
+        merged = lr.merge_into(
+            pa.table(
+                {
+                    "amount": as_stored([updated_coeff, updated_coeff, inserted_coeff]),
+                    "value": ["first", "second", "inserted"],
+                }
+            ),
+            path,
+            on="amount",
+            num_workers=1,
+        )
+        rows = {row["amount"]: row["value"] for row in merged.to_table().to_pylist()}
+        assert rows[kept] == "keep"
+        assert rows[updated_key] in {"first", "second"}
+        assert rows[inserted_key] == "inserted"
+        assert len(rows) == 3
+        assert merged.schema.field("amount").type == decimal_type
 
     def test_dates_outside_python_year_range(self, temp_dir: str) -> None:
         """date32/date64 values outside year 1–9999 survive sort and lookup."""
