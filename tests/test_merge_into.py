@@ -726,11 +726,15 @@ class TestMergeInto:
         assert len(dict_rows) == 3
         assert pa.types.is_dictionary(updated.schema.field("label").type)
 
+        import numpy as np
+
         float_path = str(Path(temp_dir) / "float16_key")
+        # Older PyArrow builds reject Python ints in a float16 array and
+        # require numpy.float16 values.
         lance.write_dataset(
             pa.table(
                 {
-                    "score": pa.array([1, 2], type=pa.float16()),
+                    "score": pa.array(np.array([1, 2], dtype=np.float16)),
                     "value": ["a", "old"],
                 }
             ),
@@ -739,7 +743,7 @@ class TestMergeInto:
         updated = lr.merge_into(
             pa.table(
                 {
-                    "score": pa.array([2, 2, 3], type=pa.float16()),
+                    "score": pa.array(np.array([2, 2, 3], dtype=np.float16)),
                     "value": ["first", "second", "inserted"],
                 }
             ),
@@ -747,7 +751,9 @@ class TestMergeInto:
             on="score",
             num_workers=1,
         )
-        scores = {row["score"]: row["value"] for row in updated.to_table().to_pylist()}
+        scores = {
+            float(row["score"]): row["value"] for row in updated.to_table().to_pylist()
+        }
         assert scores[1.0] == "a"
         assert scores[2.0] in {"first", "second"}
         assert scores[3.0] == "inserted"
