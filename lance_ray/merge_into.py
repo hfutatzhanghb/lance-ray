@@ -282,6 +282,46 @@ def _decimal_type_name(arrow_type: pa.DataType, precision: int, scale: int) -> s
     return f"{family}({precision}, {scale})"
 
 
+# 10**75 is the largest power of ten that fits in Decimal256 (76 digits).
+_MAX_DECIMAL_POWER_EXPONENT = 75
+
+
+def _negative_scale_power_factor(arrow_type: pa.DataType, exponent: int) -> str:
+    """Precision-1 decimal equal to ``10**exponent``, stored at scale ``-exponent``.
+
+    The scale-0 spelling of ``10**exponent`` has ``exponent + 1`` digits. A
+    single factor stays within Decimal256. Callers split larger exponents.
+    """
+    power_text = "1" + ("0" * exponent)
+    power_digits = len(power_text)
+    power_family = "Decimal256" if power_digits > 38 else "Decimal128"
+    scale0 = (
+        f"arrow_cast({_sql_string_literal(power_text)}, "
+        f"{_sql_string_literal(f'{power_family}({power_digits}, 0)')})"
+    )
+    return (
+        f"arrow_cast({scale0}, "
+        f"{_sql_string_literal(_decimal_type_name(arrow_type, 1, -exponent))})"
+    )
+
+
+def _negative_scale_power(arrow_type: pa.DataType, power: int) -> str:
+    """Product of precision-1 factors equal to ``10**power``.
+
+    ``decimal256(76, -76)`` needs ``10**76``, which is 77 digits and does not
+    fit in one scale-0 Decimal256. ``10**75 * 10**1`` keeps every factor
+    inside that limit, and each factor's scale is already negative so the
+    coefficient multiply does not widen.
+    """
+    factors: list[str] = []
+    remaining = power
+    while remaining:
+        chunk = min(remaining, _MAX_DECIMAL_POWER_EXPONENT)
+        factors.append(_negative_scale_power_factor(arrow_type, chunk))
+        remaining -= chunk
+    return " * ".join(factors)
+
+
 def _sql_negative_scale_decimal(
     quantized: Decimal, arrow_type: pa.DataType, precision: int, scale: int
 ) -> str:
@@ -289,36 +329,19 @@ def _sql_negative_scale_decimal(
 
     Lance cannot cast a string onto a negative scale, and a bare number is
     parsed as Float64 once it no longer fits in an integer token. Multiplying
-    the coefficient by a scale-0 power of ten overflows a full-precision
-    ``decimal128(38, -2)`` or ``decimal256(76, -2)`` before the final cast.
-    The power of ten is therefore a precision-1 decimal at the same negative
-    scale (coefficient 1). The product coefficient stays inside ``precision``.
+    the coefficient by a scale-0 power of ten overflows a full-precision value
+    before the final cast. The power of ten is a precision-1 decimal, or a
+    product of them when ``10**(-scale)`` has more than 76 digits. The product
+    coefficient stays inside ``precision``.
     """
     coefficient = format(quantized.scaleb(scale), "f")
-    power = -scale
-    power_text = "1" + ("0" * power)
-    power_digits = len(power_text)
-    if power_digits > 76:
-        raise ValueError(
-            f"Decimal join key scale {scale} needs a {power_digits}-digit power "
-            "of ten, which does not fit in Decimal256"
-        )
-    power_family = "Decimal256" if power_digits > 38 else "Decimal128"
     coefficient_literal = (
         f"arrow_cast({_sql_string_literal(coefficient)}, "
         f"{_sql_string_literal(_decimal_type_name(arrow_type, precision, 0))})"
     )
-    power_scale0 = (
-        f"arrow_cast({_sql_string_literal(power_text)}, "
-        f"{_sql_string_literal(f'{power_family}({power_digits}, 0)')})"
-    )
-    power_literal = (
-        f"arrow_cast({power_scale0}, "
-        f"{_sql_string_literal(_decimal_type_name(arrow_type, 1, scale))})"
-    )
     target_name = _decimal_type_name(arrow_type, precision, scale)
     return (
-        f"arrow_cast({coefficient_literal} * {power_literal}, "
+        f"arrow_cast({coefficient_literal} * {_negative_scale_power(arrow_type, -scale)}, "
         f"{_sql_string_literal(target_name)})"
     )
 

@@ -230,6 +230,18 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
         "'Decimal128(38, 0)') * arrow_cast(arrow_cast('100', 'Decimal128(3, 0)'), "
         "'Decimal128(1, -2)'), 'Decimal128(38, -2)')"
     )
+    with localcontext(Context(prec=160)):
+        huge = Decimal("1E76")
+    huge_literal = _sql_literal(huge, pa.decimal256(76, -76))
+    assert "Decimal256(77" not in huge_literal
+    assert huge_literal == (
+        "arrow_cast(arrow_cast('1', 'Decimal256(76, 0)') * "
+        "arrow_cast(arrow_cast("
+        "'1000000000000000000000000000000000000000000000000000000000000000000000000000', "
+        "'Decimal256(76, 0)'), 'Decimal256(1, -75)') * "
+        "arrow_cast(arrow_cast('10', 'Decimal128(2, 0)'), 'Decimal256(1, -1)'), "
+        "'Decimal256(76, -76)')"
+    )
 
 
 def test_sql_identifier_doubles_embedded_backticks() -> None:
@@ -954,6 +966,52 @@ class TestMergeInto:
         assert rows[inserted_key] == "inserted"
         assert len(rows) == 3
         assert merged.schema.field("amount").type == decimal_type
+
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_decimal256_scale_minus_76(self, temp_dir: str, with_index: bool) -> None:
+        """decimal256(76, -76) matches without a 77-digit scale-0 power of ten."""
+        from decimal import Context, localcontext
+
+        decimal_type = pa.decimal256(76, -76)
+        with localcontext(Context(prec=160)):
+            kept = Decimal("1E76")
+            updated_key = Decimal("2E76")
+            inserted_key = Decimal("3E76")
+        scale0 = pa.decimal256(76, 0)
+
+        def as_stored(values: list[Decimal]) -> Any:
+            coefficients = [value.scaleb(decimal_type.scale) for value in values]
+            encoded = pa.array(coefficients, type=scale0)
+            return pa.Array.from_buffers(decimal_type, len(encoded), encoded.buffers())
+
+        path = str(Path(temp_dir) / f"scale_minus_76_{with_index}")
+        lance.write_dataset(
+            pa.table(
+                {
+                    "amount": as_stored([kept, updated_key]),
+                    "value": ["keep", "old"],
+                }
+            ),
+            path,
+        )
+        if with_index:
+            lance.dataset(path).create_scalar_index("amount", index_type="BTREE")
+        merged = lr.merge_into(
+            pa.table(
+                {
+                    "amount": as_stored([updated_key, updated_key, inserted_key]),
+                    "value": ["first", "second", "inserted"],
+                }
+            ),
+            path,
+            on="amount",
+            num_workers=1,
+        )
+        rows = {row["amount"]: row["value"] for row in merged.to_table().to_pylist()}
+        assert rows[kept] == "keep"
+        assert rows[updated_key] in {"first", "second"}
+        assert rows[inserted_key] == "inserted"
+        assert len(rows) == 3
 
     def test_dates_outside_python_year_range(self, temp_dir: str) -> None:
         """date32/date64 values outside year 1–9999 survive sort and lookup."""
