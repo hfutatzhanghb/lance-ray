@@ -397,6 +397,20 @@ def test_nonfinite_float_keys_are_rejected() -> None:
         _align_chunk(inf_rows, inf_rows.schema, "score")
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("dictionary", [False, True])
+def test_nonfinite_float16_keys_are_rejected(bad: float, dictionary: bool) -> None:
+    import numpy as np
+    from lance_ray.merge_into import _align_chunk
+
+    keys: pa.Array[Any] = pa.array(np.array([1.0, bad], dtype=np.float16))
+    if dictionary:
+        keys = pa.DictionaryArray.from_arrays(pa.array([0, 1], type=pa.int8()), keys)
+    rows = pa.table({"score": keys, "value": ["a", "b"]})
+    with pytest.raises(ValueError, match="finite"):
+        _align_chunk(rows, rows.schema, "score")
+
+
 def test_empty_temporal_batches_keep_one_schema() -> None:
     from lance_ray.merge_into import _add_sort_key, _dedupe_source_batch
 

@@ -506,6 +506,10 @@ def _raise_if_nonfinite_float_keys(
     if not pa.types.is_floating(arrow_type):
         return
     values = column.cast(arrow_type) if pa.types.is_dictionary(column.type) else column
+    if pa.types.is_float16(arrow_type):
+        # Older Arrow releases have no half-float is_nan/is_inf kernels.
+        # Float32 represents every half value exactly; only validation widens.
+        values = values.cast(pa.float32())
     if pc.any(pc.is_nan(values)).as_py() or pc.any(pc.is_inf(values)).as_py():
         raise ValueError(
             f"Join key column {on!r} contains NaN or infinity. "
