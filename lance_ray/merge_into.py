@@ -207,7 +207,17 @@ def _sql_identifier(name: str) -> str:
     return "`" + name.replace("`", "``") + "`"
 
 
-def _sql_date_literal(value: Any) -> str:
+def _sql_date_literal(value: Any, arrow_type: pa.DataType) -> str:
+    """Render a date key, using integer ticks outside Python's year range.
+
+    ``datetime.date`` only accepts years 1 through 9999. Lance date32/date64
+    values outside that range cannot survive ``to_pylist()`` or a ``DATE``
+    literal, so the plan passes the underlying day or millisecond count and
+    ``arrow_cast`` rebuilds the exact Arrow value.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        type_name = "Date64" if pa.types.is_date64(arrow_type) else "Date32"
+        return f"arrow_cast({int(value)}, {_sql_string_literal(type_name)})"
     if isinstance(value, datetime.datetime):
         value = value.date()
     if not isinstance(value, datetime.date):
@@ -245,11 +255,15 @@ def _sql_temporal_literal(value: Any, arrow_type: pa.DataType) -> str:
 
 
 def _join_key_values(column: pa.ChunkedArray[Any]) -> list[Any]:
-    """Keep temporal keys as integer ticks on both sides of the lookup."""
+    """Keep temporal and date keys as integer ticks on both sides of the lookup."""
     arrow_type = _unwrap_dictionary_type(column.type)
     if pa.types.is_timestamp(arrow_type) or pa.types.is_time(arrow_type):
         integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
         return column.cast(arrow_type).cast(integer_type).to_pylist()
+    if pa.types.is_date32(arrow_type):
+        return column.cast(arrow_type).cast(pa.int32()).to_pylist()
+    if pa.types.is_date64(arrow_type):
+        return column.cast(arrow_type).cast(pa.int64()).to_pylist()
     return column.to_pylist()
 
 
@@ -263,6 +277,50 @@ def _integer_column_values(column: pa.ChunkedArray[Any]) -> list[int]:
     return values
 
 
+def _decimal_type_name(arrow_type: pa.DataType, precision: int, scale: int) -> str:
+    family = "Decimal256" if pa.types.is_decimal256(arrow_type) else "Decimal128"
+    return f"{family}({precision}, {scale})"
+
+
+def _sql_negative_scale_decimal(
+    quantized: Decimal, arrow_type: pa.DataType, precision: int, scale: int
+) -> str:
+    """Render ``coefficient * 10**(-scale)`` cast back to the original type.
+
+    Lance cannot cast a string onto a decimal with a negative scale, and a
+    bare numeric literal of the scaled value is parsed as Float64 once it no
+    longer fits in an integer token. The coefficient fits in ``precision``
+    digits. Multiplying by an exact power of ten reconstructs the value.
+    """
+    coefficient = format(quantized.scaleb(scale), "f")
+    power = -scale
+    power_text = "1" + ("0" * power)
+    power_digits = len(power_text)
+    if power_digits > 76:
+        raise ValueError(
+            f"Decimal join key scale {scale} needs a {power_digits}-digit power "
+            "of ten, which does not fit in Decimal256"
+        )
+    power_name = (
+        f"Decimal256({power_digits}, 0)"
+        if power_digits > 38
+        else f"Decimal128({power_digits}, 0)"
+    )
+    coefficient_literal = (
+        f"arrow_cast({_sql_string_literal(coefficient)}, "
+        f"{_sql_string_literal(_decimal_type_name(arrow_type, precision, 0))})"
+    )
+    power_literal = (
+        f"arrow_cast({_sql_string_literal(power_text)}, "
+        f"{_sql_string_literal(power_name)})"
+    )
+    target_name = _decimal_type_name(arrow_type, precision, scale)
+    return (
+        f"arrow_cast({coefficient_literal} * {power_literal}, "
+        f"{_sql_string_literal(target_name)})"
+    )
+
+
 def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
     if not pa.types.is_decimal(arrow_type):
         raise TypeError(f"Expected a decimal join key type, got {arrow_type}")
@@ -270,21 +328,24 @@ def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
     scale = int(arrow_type.scale)
     if not isinstance(value, Decimal):
         value = Decimal(str(value))
-    # The process-wide decimal context defaults to precision 28, which rejects
-    # legal decimal128 (up to 38 digits) and decimal256 keys.
-    with localcontext(Context(prec=max(precision, 1))):
+    # The process-wide decimal context defaults to precision 28. A negative
+    # scale makes the scaled integer longer than ``precision`` digits.
+    scaled_digits = precision + max(-scale, 0)
+    with localcontext(Context(prec=max(scaled_digits, 1))):
         try:
             quantized = value.quantize(Decimal(1).scaleb(-scale))
         except InvalidOperation as exc:
             raise ValueError(
                 f"Decimal join key {value} does not fit DECIMAL({precision},{scale})"
             ) from exc
+        if scale < 0:
+            return _sql_negative_scale_decimal(quantized, arrow_type, precision, scale)
     rendered = format(quantized, "f")
     # Lance 12 parses a SQL DECIMAL literal as Decimal128, so a Decimal256
     # value with more than 38 digits cannot use that syntax. arrow_cast keeps
     # the full precision.
     if pa.types.is_decimal256(arrow_type):
-        type_name = f"Decimal256({precision}, {scale})"
+        type_name = _decimal_type_name(arrow_type, precision, scale)
         return (
             f"arrow_cast({_sql_string_literal(rendered)}, "
             f"{_sql_string_literal(type_name)})"
@@ -330,14 +391,30 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
     if pa.types.is_boolean(arrow_type):
         return "TRUE" if value else "FALSE"
     if pa.types.is_integer(arrow_type):
-        return str(int(value))
+        number = int(value)
+        # Lance parses a bare SQL number as Float64 when it does not fit in
+        # a signed 64-bit token. Int64's minimum is that value: the float
+        # rounding cannot be cast back to Int64. A string arrow_cast keeps
+        # every digit.
+        if number == -9223372036854775808:
+            bits = int(arrow_type.bit_width)
+            type_name = (
+                f"Int{bits}"
+                if pa.types.is_signed_integer(arrow_type)
+                else f"UInt{bits}"
+            )
+            return (
+                f"arrow_cast({_sql_string_literal(str(number))}, "
+                f"{_sql_string_literal(type_name)})"
+            )
+        return str(number)
     if pa.types.is_floating(arrow_type):
-        number = float(value)
-        if not math.isfinite(number):
+        as_float = float(value)
+        if not math.isfinite(as_float):
             raise ValueError(
                 "Floating join keys must be finite; NaN and infinity are rejected."
             )
-        rendered = repr(number)
+        rendered = repr(as_float)
         # Lance parses an untyped SQL float as Float64 and cannot cast that
         # literal onto a Float16 column.
         if pa.types.is_float16(arrow_type):
@@ -346,7 +423,7 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
     if _is_string_type(arrow_type):
         return _sql_string_literal(value)
     if pa.types.is_date(arrow_type):
-        return _sql_date_literal(value)
+        return _sql_date_literal(value, arrow_type)
     if pa.types.is_timestamp(arrow_type) or pa.types.is_time(arrow_type):
         return _sql_temporal_literal(value, arrow_type)
     if pa.types.is_decimal(arrow_type):
@@ -530,9 +607,26 @@ def _owned_integer_array(
 
 
 def _with_rowid_column(
-    table: pa.Table, row_ids: list[int], rowid_column: str
+    table: pa.Table,
+    row_ids: list[int],
+    rowid_column: str,
+    *,
+    rowid_type: pa.DataType,
 ) -> pa.Table:
-    return table.append_column(rowid_column, pa.array(row_ids, type=pa.int64()))
+    return table.append_column(rowid_column, pa.array(row_ids, type=rowid_type))
+
+
+def _with_insert_rowid_column(
+    table: pa.Table, rowid_column: str, *, rowid_type: pa.DataType
+) -> pa.Table:
+    """Attach a placeholder row-id column that inserts drop before writing.
+
+    ``-1`` does not fit in Lance's UInt64 ``_rowid``. Nulls are legal for
+    both signed and unsigned types, and the column is removed before the
+    insert fragment is written. Commit assigns new ids.
+    """
+    placeholder = pa.nulls(table.num_rows, type=pa.int64()).cast(rowid_type)
+    return table.append_column(rowid_column, placeholder)
 
 
 def _with_match_identity(
@@ -541,10 +635,12 @@ def _with_match_identity(
     offsets: list[int],
     rowid_column: str,
     offset_column: str,
+    *,
+    rowid_type: pa.DataType,
 ) -> pa.Table:
-    return _with_rowid_column(table, row_ids, rowid_column).append_column(
-        offset_column, pa.array(offsets, type=pa.int64())
-    )
+    return _with_rowid_column(
+        table, row_ids, rowid_column, rowid_type=rowid_type
+    ).append_column(offset_column, pa.array(offsets, type=pa.int64()))
 
 
 def _rowaddr_parts(rowaddr: int) -> tuple[int, int]:
@@ -560,6 +656,8 @@ def _pack_plan_buckets(
     inserts_by_owner: list[list[int]],
     rowid_column: str,
     offset_column: str,
+    *,
+    rowid_type: pa.DataType,
 ) -> tuple[list[int], list[dict[str, Any]], list[int]]:
     """Build apply-owner payloads, omitting owners with no rows.
 
@@ -582,12 +680,13 @@ def _pack_plan_buckets(
                 offsets,
                 rowid_column,
                 offset_column,
+                rowid_type=rowid_type,
             )
         inserts = None
         if inserts_by_owner[owner]:
             insert_table = source_chunk.take(inserts_by_owner[owner])
-            inserts = _with_rowid_column(
-                insert_table, [-1] * insert_table.num_rows, rowid_column
+            inserts = _with_insert_rowid_column(
+                insert_table, rowid_column, rowid_type=rowid_type
             )
         rows = sum(t.num_rows for t in frags.values()) + (
             inserts.num_rows if inserts is not None else 0
@@ -634,9 +733,13 @@ def _sort_helper_type(arrow_type: pa.DataType) -> pa.DataType | None:
     """Return a sortable projection of ``arrow_type``, or None.
 
     Dictionary columns and ``float16`` have no Arrow sort or inequality
-    kernel. Temporal values are projected to integer ticks so Ray's boundary
-    sample does not round them through Python. The original column stays in
-    the batch; only the helper is sorted and compared.
+    kernel. Temporal values and dates are projected to integer ticks so Ray's
+    boundary sample does not round them through Python ``datetime``. Dates
+    outside year 1–9999 overflow ``to_pylist()``. Decimals with a negative
+    scale have no inequality kernel; their helper is the unscaled coefficient
+    (same order and equality, and it always fits in ``precision`` digits).
+    The original column stays in the batch; only the helper is sorted and
+    compared.
     """
     value_type = _unwrap_dictionary_type(arrow_type)
     if pa.types.is_float16(value_type):
@@ -645,9 +748,47 @@ def _sort_helper_type(arrow_type: pa.DataType) -> pa.DataType | None:
         return pa.int32()
     if pa.types.is_time(value_type) or pa.types.is_timestamp(value_type):
         return pa.int64()
+    if pa.types.is_date32(value_type):
+        return pa.int32()
+    if pa.types.is_date64(value_type):
+        return pa.int64()
+    if pa.types.is_decimal(value_type) and int(value_type.scale) < 0:
+        precision = int(value_type.precision)
+        if pa.types.is_decimal256(value_type):
+            return pa.decimal256(precision, 0)
+        return pa.decimal128(precision, 0)
     if pa.types.is_dictionary(arrow_type):
         return value_type
     return None
+
+
+def _decimal_coefficient(
+    column: pa.Array[Any] | pa.ChunkedArray[Any], arrow_type: pa.DataType
+) -> pa.Array[Any] | pa.ChunkedArray[Any]:
+    """Reinterpret a negative-scale decimal as its unscaled coefficient.
+
+    Casting to scale 0 rescales the numeric value and can overflow
+    ``precision``. The scale lives in the type, not the buffer, so the same
+    bytes are already the coefficient.
+    """
+    if not pa.types.is_decimal(arrow_type):
+        raise TypeError(f"Expected a decimal join key type, got {arrow_type}")
+    precision = int(arrow_type.precision)
+    if pa.types.is_decimal256(arrow_type):
+        coefficient_type: pa.DataType = pa.decimal256(precision, 0)
+    else:
+        coefficient_type = pa.decimal128(precision, 0)
+    chunks = list(column.chunks) if isinstance(column, pa.ChunkedArray) else [column]
+    projected: list[pa.Array[Any]] = []
+    for chunk in chunks:
+        if chunk.offset != 0:
+            chunk = pa.concat_arrays([chunk])
+        projected.append(
+            pa.Array.from_buffers(coefficient_type, len(chunk), chunk.buffers())
+        )
+    if isinstance(column, pa.ChunkedArray):
+        return pa.chunked_array(projected)
+    return projected[0]
 
 
 def _add_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table:
@@ -666,9 +807,14 @@ def _add_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table:
         return batch.append_column(sort_column, pa.array([], type=helper_type))
     value_type = _unwrap_dictionary_type(keys.type)
     projected = keys.cast(value_type) if pa.types.is_dictionary(keys.type) else keys
-    if not projected.type.equals(helper_type):
-        projected = projected.cast(helper_type)
-    return batch.append_column(sort_column, projected)
+    helper_column: Any
+    if pa.types.is_decimal(value_type) and int(value_type.scale) < 0:
+        helper_column = _decimal_coefficient(projected, value_type)
+    elif not projected.type.equals(helper_type):
+        helper_column = projected.cast(helper_type)
+    else:
+        helper_column = projected
+    return batch.append_column(sort_column, helper_column)
 
 
 def _dedupe_source_batch(batch: Any, *, on: str, sort_column: str | None) -> pa.Table:
@@ -761,6 +907,9 @@ def _plan_task(
             list
         )
         key_type = target_schema.field(on).type
+        # Lance stable row ids are UInt64. Values at or above 2**63 overflow
+        # if this column is narrowed to Int64 while the buckets are built.
+        rowid_type: pa.DataType = pa.uint64()
         for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
             in_list = ", ".join(_sql_literal(key, key_type) for key in batch)
             # Backticks are Lance's identifier quoting (double quotes would be
@@ -773,6 +922,7 @@ def _plan_task(
                 with_row_address=True,
                 with_row_id=True,
             )
+            rowid_type = hit_table.schema.field("_rowid").type
             for key, rowaddr, rowid in zip(
                 _join_key_values(hit_table.column(on)),
                 _integer_column_values(hit_table.column("_rowaddr")),
@@ -812,6 +962,7 @@ def _plan_task(
             inserts_by_owner,
             rowid_column,
             offset_column,
+            rowid_type=rowid_type,
         )
         # Ray sends acknowledgements into streaming generators. A delegated
         # generator supports send(); a plain list iterator does not.
@@ -890,8 +1041,8 @@ def _write_bucket(
     inserted_rows = 0
     inserts = payload["inserts"]
     if inserts is not None and inserts.num_rows:
-        # Insert rows carry no useful rowid (-1); strip the helper column so
-        # the appended rows match the target schema. Commit assigns new ids.
+        # Insert rows carry a null row-id placeholder; strip it so the
+        # appended rows match the target schema. Commit assigns new ids.
         insert_table = inserts.drop_columns([rowid_column])
         written.extend(
             _write_append_fragments(
@@ -1373,6 +1524,10 @@ def _source_to_chunk_refs(
     if isinstance(source, pa.Table):
         if source.num_rows == 0:
             return []
+        # string_view and binary_view cast to the target string/binary types,
+        # but Ray's Arrow serialization rejects the view types. Convert the
+        # in-memory table before it is handed to ``from_arrow``.
+        source = _align_chunk(source, target_schema, on)
         dataset = _require_ray_dataset(ray.data.from_arrow(source))
     elif isinstance(source, ray.data.Dataset):
         dataset = source
@@ -1484,11 +1639,17 @@ def merge_into(
         on: The join key column name. Supported types are boolean, integer,
             floating, string, date, timestamp, time, decimal, and binary
             (dictionary-encoded scalars unwrap to the value type). Floating
-            keys must be finite; NaN and infinity are rejected. Nested types
-            are rejected on the driver before any Ray task starts. A scalar
-            index on this column is strongly recommended for large targets
-            (the plan phase falls back to filtered scans without one). Every
-            target row whose key matches a source row is updated (join-all).
+            keys must be finite; NaN and infinity are rejected. The Int64
+            minimum is rendered as a typed literal. Dates outside year 1–9999
+            are sorted and looked up as integer ticks. Decimals with a
+            negative scale are sorted on their unscaled coefficient and looked
+            up with a typed cast. A column name containing a backtick is
+            rejected: Lance 12 cannot resolve that field in a filter. Nested
+            types are rejected on the driver before any Ray task starts. A
+            scalar index on this column is strongly recommended for large
+            targets (the plan phase falls back to filtered scans without one).
+            Every target row whose key matches a source row is updated
+            (join-all).
         table_id: The table identifier as a list of strings. Must be provided
             together with ``namespace_impl``.
         namespace_impl: The namespace implementation type (e.g. ``"rest"``,
@@ -1566,6 +1727,13 @@ def merge_into(
     if on not in target_schema.names:
         raise ValueError(
             f"Join key column {on!r} not found in target schema {target_schema.names}"
+        )
+    if "`" in on:
+        raise ValueError(
+            f"Join key column {on!r} contains a backtick. Lance 12 drops that "
+            "field from its query schema, so a filter cannot read the column. "
+            "merge_into rejects the key instead of planning a merge that "
+            "cannot match rows."
         )
     _raise_unless_supported_join_key(on, target_schema.field(on).type)
     if not _has_scalar_index_on(dataset, on):

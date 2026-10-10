@@ -115,13 +115,19 @@ def test_pack_plan_buckets_omits_empty_owners() -> None:
     inserts: list[list[int]] = [[] for _ in range(4)]
     inserts[1] = [1]
     owners, buckets, bucket_rows = _pack_plan_buckets(
-        4, chunk, updates, inserts, _ROWID_COLUMN, _OFFSET_COLUMN
+        4,
+        chunk,
+        updates,
+        inserts,
+        _ROWID_COLUMN,
+        _OFFSET_COLUMN,
+        rowid_type=pa.int64(),
     )
     assert owners == [1, 2]
     assert bucket_rows == [0, 1, 1, 0]
     assert buckets[0]["frags"] == {}
     assert buckets[0]["inserts"].num_rows == 1
-    assert _ROWID_COLUMN in buckets[0]["inserts"].column_names
+    assert buckets[0]["inserts"].column(_ROWID_COLUMN).to_pylist() == [None]
     matched = buckets[1]["frags"][5]
     assert matched.num_rows == 1
     assert matched.column(_OFFSET_COLUMN).to_pylist() == [3]
@@ -170,8 +176,15 @@ def test_sql_literal_renders_common_scalars() -> None:
     assert _sql_literal(True) == "TRUE"
     assert _sql_literal(False, pa.bool_()) == "FALSE"
     assert _sql_literal(7, pa.int64()) == "7"
+    assert _sql_literal(-9223372036854775808, pa.int64()) == (
+        "arrow_cast('-9223372036854775808', 'Int64')"
+    )
     assert _sql_literal("O'Brien") == "'O''Brien'"
     assert _sql_literal(datetime.date(2024, 1, 15), pa.date32()) == "DATE '2024-01-15'"
+    assert _sql_literal(2932897, pa.date32()) == "arrow_cast(2932897, 'Date32')"
+    assert _sql_literal(253402300800000, pa.date64()) == (
+        "arrow_cast(253402300800000, 'Date64')"
+    )
     assert (
         _sql_literal(
             datetime.datetime(2024, 1, 15, 12, 30, 0),
@@ -201,6 +214,10 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
     wide = Decimal("9" * 40)
     assert _sql_literal(wide, pa.decimal256(40, 0)) == (
         f"arrow_cast('{wide}', 'Decimal256(40, 0)')"
+    )
+    assert _sql_literal(Decimal("100"), pa.decimal128(3, -2)) == (
+        "arrow_cast(arrow_cast('1', 'Decimal128(3, 0)') * "
+        "arrow_cast('100', 'Decimal128(3, 0)'), 'Decimal128(3, -2)')"
     )
 
 
@@ -767,26 +784,200 @@ class TestMergeInto:
         assert table.column("value").to_pylist() == ["new"]
         assert table.column("amount").to_pylist() == [amount]
 
-    def test_backtick_in_join_column_name_is_escaped(self, temp_dir: str) -> None:
-        """A legal column name containing a backtick must not end the SQL identifier."""
-        from lance_ray.merge_into import _sql_identifier
-
+    def test_backtick_join_column_is_rejected(self, temp_dir: str) -> None:
+        """Lance 12 cannot resolve a field whose name contains a backtick."""
         name = "key`name"
-        assert _sql_identifier(name) == "`key``name`"
         path = str(Path(temp_dir) / "backtick_key")
         lance.write_dataset(
             pa.table({name: pa.array([1], type=pa.int64()), "value": ["old"]}),
             path,
         )
-        dataset = lance.dataset(path)
-        try:
-            matched = dataset.to_table(
-                columns=["value"], filter=f"{_sql_identifier(name)} = 1"
+        with pytest.raises(ValueError, match="backtick"):
+            lr.merge_into(
+                pa.table({name: pa.array([1], type=pa.int64()), "value": ["new"]}),
+                path,
+                on=name,
+                num_workers=1,
             )
-        except Exception as exc:
-            assert "Expected close delimiter" not in str(exc)
-        else:
-            assert matched.column("value").to_pylist() == ["old"]
+
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_int64_min_join_key(self, temp_dir: str, with_index: bool) -> None:
+        """Int64 minimum matches through a typed literal, with or without an index."""
+        path = str(Path(temp_dir) / f"int64_min_{with_index}")
+        minimum = -9223372036854775808
+        lance.write_dataset(
+            pa.table(
+                {
+                    "id": pa.array([minimum, 1], type=pa.int64()),
+                    "value": ["old", "keep"],
+                }
+            ),
+            path,
+        )
+        if with_index:
+            lance.dataset(path).create_scalar_index("id", index_type="BTREE")
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "id": pa.array([minimum, 2], type=pa.int64()),
+                    "value": ["new", "inserted"],
+                }
+            ),
+            path,
+            on="id",
+            num_workers=1,
+        )
+        rows = {row["id"]: row["value"] for row in updated.to_table().to_pylist()}
+        assert rows[minimum] == "new"
+        assert rows[1] == "keep"
+        assert rows[2] == "inserted"
+        assert len(rows) == 3
+
+    def test_negative_scale_decimal_keys(self, temp_dir: str) -> None:
+        """Negative-scale decimals sort on their coefficient and match exactly."""
+        cases = (
+            (pa.decimal128(3, -2), Decimal("100"), Decimal("200"), Decimal("300")),
+            (
+                pa.decimal256(40, -2),
+                Decimal(10) ** 41,
+                (Decimal(10) ** 39) * 2,
+                (Decimal(10) ** 39) * 3,
+            ),
+        )
+        for index, (decimal_type, kept, updated_key, inserted_key) in enumerate(cases):
+            path = str(Path(temp_dir) / f"neg_scale_{index}")
+            lance.write_dataset(
+                pa.table(
+                    {
+                        "amount": pa.array([kept, updated_key], type=decimal_type),
+                        "value": ["keep", "old"],
+                    }
+                ),
+                path,
+            )
+            merged = lr.merge_into(
+                pa.table(
+                    {
+                        "amount": pa.array(
+                            [updated_key, updated_key, inserted_key], type=decimal_type
+                        ),
+                        "value": ["first", "second", "inserted"],
+                    }
+                ),
+                path,
+                on="amount",
+                num_workers=1,
+            )
+            rows = {
+                row["amount"]: row["value"] for row in merged.to_table().to_pylist()
+            }
+            assert rows[kept] == "keep"
+            assert rows[updated_key] in {"first", "second"}
+            assert rows[inserted_key] == "inserted"
+            assert len(rows) == 3
+            assert merged.schema.field("amount").type == decimal_type
+
+    def test_dates_outside_python_year_range(self, temp_dir: str) -> None:
+        """date32/date64 values outside year 1–9999 survive sort and lookup."""
+        path = str(Path(temp_dir) / "wide_dates")
+        day = 2932897
+        millis = 253402300800000
+        lance.write_dataset(
+            pa.table(
+                {
+                    "day": pa.array([day, -719164], type=pa.date32()),
+                    "millis": pa.array([millis, 0], type=pa.date64()),
+                    "value": ["future", "past"],
+                }
+            ),
+            path,
+        )
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "day": pa.array([day, 0], type=pa.date32()),
+                    "millis": pa.array([millis, 86_400_000], type=pa.date64()),
+                    "value": ["updated", "inserted"],
+                }
+            ),
+            path,
+            on="day",
+            num_workers=1,
+        )
+        table = updated.to_table()
+        rows = dict(
+            zip(
+                table.column("day").cast(pa.int32()).to_pylist(),
+                table.column("value").to_pylist(),
+                strict=True,
+            )
+        )
+        assert rows[day] == "updated"
+        assert rows[-719164] == "past"
+        assert rows[0] == "inserted"
+        assert len(rows) == 3
+
+    def test_uint64_row_ids_above_int64_max(self, temp_dir: str) -> None:
+        """Stable row ids at or above 2**63 stay UInt64, and inserts still commit."""
+        from lance.fragment import RowIdSequence
+
+        path = str(Path(temp_dir) / "high_row_ids")
+        table = pa.table({"id": [1, 2], "value": ["a", "b"]})
+        fragments = lance.fragment.write_fragments(
+            table, path, mode="create", enable_stable_row_ids=True
+        )
+        high = 2**63
+        fragments[0].row_id_meta = RowIdSequence(
+            pa.array([high, high + 1], type=pa.uint64())
+        ).to_inline_metadata()
+        lance.LanceDataset.commit(
+            path,
+            lance.LanceOperation.Overwrite(table.schema, fragments),
+            enable_stable_row_ids=True,
+        )
+        updated = lr.merge_into(
+            pa.table({"id": [2, 3], "value": ["updated", "inserted"]}),
+            path,
+            on="id",
+            num_workers=1,
+        )
+        rows = {
+            row["id"]: row for row in updated.to_table(with_row_id=True).to_pylist()
+        }
+        assert rows[1]["_rowid"] == high
+        assert rows[1]["value"] == "a"
+        assert rows[2]["_rowid"] == high + 1
+        assert rows[2]["value"] == "updated"
+        assert rows[3]["value"] == "inserted"
+        assert rows[3]["_rowid"] not in {high, high + 1}
+
+    def test_arrow_view_source_is_cast_before_ray(self, temp_dir: str) -> None:
+        """string_view and binary_view tables are converted before Ray serializes them."""
+        path = str(Path(temp_dir) / "views")
+        lance.write_dataset(
+            pa.table(
+                {
+                    "label": ["keep", "old"],
+                    "payload": [b"aa", b"bb"],
+                    "value": ["a", "b"],
+                }
+            ),
+            path,
+        )
+        source = pa.table(
+            {
+                "label": pa.array(["old", "old", "new"], type=pa.string_view()),
+                "payload": pa.array([b"cc", b"dd", b"ee"], type=pa.binary_view()),
+                "value": ["first", "second", "inserted"],
+            }
+        )
+        updated = lr.merge_into(source, path, on="label", num_workers=1)
+        rows = {row["label"]: row for row in updated.to_table().to_pylist()}
+        assert rows["keep"]["value"] == "a"
+        assert rows["old"]["value"] in {"first", "second"}
+        assert rows["new"]["value"] == "inserted"
+        assert updated.schema.field("label").type == pa.string()
+        assert updated.schema.field("payload").type == pa.binary()
 
     def test_merge_into_bool_keys(self, temp_dir: str) -> None:
         """Boolean keys update the matched row and insert the missing one."""
