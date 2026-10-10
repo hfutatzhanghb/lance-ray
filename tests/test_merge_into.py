@@ -179,6 +179,13 @@ def test_sql_literal_renders_common_scalars() -> None:
     assert _sql_literal(-9223372036854775808, pa.int64()) == (
         "arrow_cast('-9223372036854775808', 'Int64')"
     )
+    assert _sql_literal(2**63 - 1, pa.uint64()) == "9223372036854775807"
+    assert _sql_literal(2**63, pa.uint64()) == (
+        "arrow_cast('9223372036854775808', 'UInt64')"
+    )
+    assert _sql_literal(2**64 - 1, pa.uint64()) == (
+        "arrow_cast('18446744073709551615', 'UInt64')"
+    )
     assert _sql_literal("O'Brien") == "'O''Brien'"
     assert _sql_literal(datetime.date(2024, 1, 15), pa.date32()) == "DATE '2024-01-15'"
     assert _sql_literal(2932897, pa.date32()) == "arrow_cast(2932897, 'Date32')"
@@ -875,6 +882,60 @@ class TestMergeInto:
         assert rows[1] == "keep"
         assert rows[2] == "inserted"
         assert len(rows) == 3
+
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_uint64_join_keys_at_and_above_int64_max(
+        self, temp_dir: str, with_index: bool
+    ) -> None:
+        """UInt64 keys at and above 2**63 match exactly, with or without an index.
+
+        2**63 + 1 is not a Float64 value. A bare SQL number would round onto
+        2**63 and either miss this row or update the neighboring key.
+        """
+        from lance_ray.merge_into import _sql_literal
+
+        path = str(Path(temp_dir) / f"uint64_high_{with_index}")
+        boundary = 2**63
+        odd = 2**63 + 1
+        maximum = 2**64 - 1
+        key_type = pa.uint64()
+        lance.write_dataset(
+            pa.table(
+                {
+                    "id": pa.array([boundary, odd, 1], type=key_type),
+                    "value": ["old-boundary", "old-odd", "keep"],
+                }
+            ),
+            path,
+        )
+        if with_index:
+            lance.dataset(path).create_scalar_index("id", index_type="BTREE")
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "id": pa.array([boundary, odd, maximum], type=key_type),
+                    "value": ["new-boundary", "new-odd", "inserted"],
+                }
+            ),
+            path,
+            on="id",
+            num_workers=1,
+        )
+        table = updated.to_table()
+        ids = table.column("id").to_pylist()
+        assert table.num_rows == 4
+        assert ids.count(boundary) == 1
+        assert ids.count(odd) == 1
+        assert ids.count(maximum) == 1
+        rows = {row["id"]: row["value"] for row in table.to_pylist()}
+        assert rows[boundary] == "new-boundary"
+        assert rows[odd] == "new-odd"
+        assert rows[1] == "keep"
+        assert rows[maximum] == "inserted"
+        odd_predicate = f"id = {_sql_literal(odd, key_type)}"
+        assert updated.to_table(filter=odd_predicate).column("value").to_pylist() == [
+            "new-odd"
+        ]
 
     def test_negative_scale_decimal_keys(self, temp_dir: str) -> None:
         """Negative-scale decimals sort on their coefficient and match exactly."""

@@ -417,11 +417,12 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
         return "TRUE" if value else "FALSE"
     if pa.types.is_integer(arrow_type):
         number = int(value)
-        # Lance parses a bare SQL number as Float64 when it does not fit in
-        # a signed 64-bit token. Int64's minimum is that value: the float
-        # rounding cannot be cast back to Int64. A string arrow_cast keeps
-        # every digit.
-        if number == -9223372036854775808:
+        # Lance parses a bare SQL number as Float64 when it does not fit in a
+        # signed 64-bit token. That token covers -(2**63 - 1) through 2**63 - 1.
+        # Int64's minimum and every UInt64 value at or above 2**63 fall outside
+        # it, and the rounded float cannot be cast back to the original integer.
+        # A string arrow_cast keeps every digit.
+        if not (-(2**63 - 1) <= number <= 2**63 - 1):
             bits = int(arrow_type.bit_width)
             type_name = (
                 f"Int{bits}"
@@ -1669,8 +1670,9 @@ def merge_into(
             floating, string, date, timestamp, time, decimal, and binary
             (dictionary-encoded scalars unwrap to the value type). Floating
             keys must be finite; NaN and infinity are rejected. The Int64
-            minimum is rendered as a typed literal. Dates outside year 1–9999
-            are sorted and looked up as integer ticks. Decimals with a
+            minimum and every UInt64 value at or above 2**63 are rendered as
+            typed literals. Dates outside year 1–9999 are sorted and looked up
+            as integer ticks. Decimals with a
             negative scale are sorted on their unscaled coefficient and looked
             up with a typed cast. A column name containing a backtick is
             rejected: Lance 12 cannot resolve that field in a filter. Nested
