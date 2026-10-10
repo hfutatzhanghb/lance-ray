@@ -360,6 +360,10 @@ def test_empty_temporal_batches_keep_one_schema() -> None:
     dropped = _dedupe_source_batch(keyed, on="ts", sort_column=sort_column)
     assert sort_column not in dropped.column_names
     assert dropped.schema == empty.schema
+    zero_column = empty.select([])
+    untouched = _add_temporal_sort_key(zero_column, on="ts", sort_column=sort_column)
+    assert untouched.num_rows == 0
+    assert untouched.column_names == []
 
 
 def test_scalar_index_field_names_use_backticks() -> None:
@@ -627,18 +631,34 @@ class TestMergeInto:
         """Finite float keys and boolean keys update and insert."""
         float_path = Path(temp_dir) / "float_key"
         lance.write_dataset(
-            pa.table({"score": [1.5, 2.5], "value": ["a", "b"]}), str(float_path)
+            pa.table(
+                {
+                    "score": [1.5, 0.1, 1e-05],
+                    "value": ["exact", "tenth", "tiny"],
+                }
+            ),
+            str(float_path),
         )
         updated = lr.merge_into(
-            pa.table({"score": [2.5, 3.5], "value": ["updated", "new"]}),
+            pa.table(
+                {
+                    "score": [0.1, 1e-05, 3.5],
+                    "value": ["tenth-new", "tiny-new", "inserted"],
+                }
+            ),
             str(float_path),
             on="score",
             num_workers=1,
         )
-        by_score = {
-            row["score"]: row["value"] for row in updated.to_table().to_pylist()
+        rows = updated.to_table().to_pylist()
+        by_score = {row["score"]: row["value"] for row in rows}
+        assert len(rows) == 4
+        assert by_score == {
+            1.5: "exact",
+            0.1: "tenth-new",
+            1e-05: "tiny-new",
+            3.5: "inserted",
         }
-        assert by_score == {1.5: "a", 2.5: "updated", 3.5: "new"}
 
         bool_path = Path(temp_dir) / "bool_key"
         lance.write_dataset(

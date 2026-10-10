@@ -614,6 +614,10 @@ def _add_temporal_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table
     """Give Ray's Python sampling an exact integer key for temporal sorting."""
     if not isinstance(batch, pa.Table):
         raise TypeError("Merge source batches must be Arrow tables")
+    # Ray's sort can emit a zero-column table for an empty range. That block
+    # has no join key to cast; leave it unchanged instead of raising KeyError.
+    if batch.num_rows == 0 and on not in batch.column_names:
+        return batch
     keys = batch.column(on)
     arrow_type = _unwrap_dictionary_type(keys.type)
     integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
@@ -896,8 +900,10 @@ def _apply_task(
     uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
     storage_version = getattr(dataset, "data_storage_version", None)
     if storage_version:
-        # The writer documents ``None`` as format 2.0. Pass the open dataset's
-        # version so a new fragment stays on the table's format.
+        # pylance documents ``data_storage_version=None`` as file format 2.0.
+        # When the destination dataset already exists, Lance loads that
+        # manifest and uses its format if the argument is omitted, so passing
+        # the open dataset's version does not change the bytes written today.
         write_kwargs["data_storage_version"] = storage_version
 
     # Pass 1 keeps packed integer identities and releases each Arrow payload
@@ -1277,6 +1283,15 @@ def _has_scalar_index_on(dataset: lance.LanceDataset, column: str) -> bool:
     return False
 
 
+def _require_ray_dataset(value: Any) -> ray.data.Dataset:
+    """Keep a Ray Dataset binding when a stub types the call as ``Any``."""
+    if isinstance(value, ray.data.Dataset):
+        return value
+    raise TypeError(
+        f"Merge source must stay a ray.data.Dataset, got {type(value).__name__}"
+    )
+
+
 def _source_to_chunk_refs(
     source: ray.data.Dataset | pa.Table,
     on: str,
@@ -1292,39 +1307,45 @@ def _source_to_chunk_refs(
     adjacent in exactly one block, so dropping adjacent duplicates per block
     is a complete global dedupe (one arbitrary row per key survives). The
     sort also hands the plan phase contiguous key slices, which keeps each
-    chunk's index lookups within few BTREE leaf pages.
+    chunk's index lookups within few BTREE leaf pages. The key type is the
+    target field type: every block is cast to ``target_schema`` before the
+    sort, so the driver does not execute the dataset to read its schema.
     """
     if isinstance(source, pa.Table):
         if source.num_rows == 0:
             return []
-        source = ray.data.from_arrow(source)
-    elif not isinstance(source, ray.data.Dataset):
+        dataset = _require_ray_dataset(ray.data.from_arrow(source))
+    elif isinstance(source, ray.data.Dataset):
+        dataset = source
+    else:
         raise TypeError(
             "source must be a ray.data.Dataset or a pyarrow.Table, got "
             f"{type(source).__name__}"
         )
-    source = source.map_batches(
-        partial(_align_source_batch, target_schema=target_schema, on=on),
-        batch_size=None,
-        batch_format="pyarrow",
+    dataset = _require_ray_dataset(
+        dataset.map_batches(
+            partial(_align_source_batch, target_schema=target_schema, on=on),
+            batch_size=None,
+            batch_format="pyarrow",
+        )
     )
     sort_column = None
-    source_schema = source.schema()
-    if source_schema is not None and isinstance(source_schema.base_schema, pa.Schema):
-        key_type = _unwrap_dictionary_type(source_schema.base_schema.field(on).type)
-        if pa.types.is_time(key_type) or pa.types.is_timestamp(key_type):
-            # Ray samples sort boundaries with Arrow's to_pylist(). Python time
-            # cannot represent time64[ns] values containing nonzero nanoseconds.
-            # Integer ticks preserve exact ordering and keep duplicate keys in
-            # one partition; the original Arrow column remains untouched.
-            sort_column = _unused_column_name(_SORT_COLUMN, set(source_schema.names))
-            source = source.map_batches(
+    key_type = _unwrap_dictionary_type(target_schema.field(on).type)
+    if pa.types.is_time(key_type) or pa.types.is_timestamp(key_type):
+        # Ray samples sort boundaries with Arrow's to_pylist(). Python time
+        # cannot represent time64[ns] values containing nonzero nanoseconds.
+        # Integer ticks preserve exact ordering and keep duplicate keys in
+        # one partition; the original Arrow column remains untouched.
+        sort_column = _unused_column_name(_SORT_COLUMN, set(target_schema.names))
+        dataset = _require_ray_dataset(
+            dataset.map_batches(
                 partial(_add_temporal_sort_key, on=on, sort_column=sort_column),
                 batch_size=None,
                 batch_format="pyarrow",
             )
-    deduped = (
-        source.repartition(num_partitions)
+        )
+    deduped = _require_ray_dataset(
+        dataset.repartition(num_partitions)
         .sort(sort_column or on)
         .map_batches(
             partial(_dedupe_source_batch, on=on, sort_column=sort_column),
