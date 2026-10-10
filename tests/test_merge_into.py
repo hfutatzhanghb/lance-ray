@@ -627,26 +627,27 @@ class TestMergeInto:
             "orig_0"
         ]
 
-    def test_merge_into_float_and_bool_keys(self, temp_dir: str) -> None:
-        """Finite float keys and boolean keys update and insert."""
-        float_path = Path(temp_dir) / "float_key"
-        lance.write_dataset(
-            pa.table(
-                {
-                    "score": [1.5, 0.1, 1e-05],
-                    "value": ["exact", "tenth", "tiny"],
-                }
-            ),
-            str(float_path),
+    @pytest.mark.parametrize("with_index", [False, True])
+    def test_merge_into_float_keys(self, temp_dir: str, with_index: bool) -> None:
+        """Finite float keys match through a scan and through a BTREE."""
+        path = str(Path(temp_dir) / "float_key")
+        target = pa.table(
+            {
+                "score": pa.array([1.5, 0.1, 1e-05], type=pa.float64()),
+                "value": ["exact", "tenth", "tiny"],
+            }
         )
+        dataset = lance.write_dataset(target, path)
+        if with_index:
+            dataset.create_scalar_index("score", index_type="BTREE")
         updated = lr.merge_into(
             pa.table(
                 {
-                    "score": [0.1, 1e-05, 3.5],
+                    "score": pa.array([0.1, 1e-05, 3.5], type=pa.float64()),
                     "value": ["tenth-new", "tiny-new", "inserted"],
                 }
             ),
-            str(float_path),
+            path,
             on="score",
             num_workers=1,
         )
@@ -659,7 +660,15 @@ class TestMergeInto:
             1e-05: "tiny-new",
             3.5: "inserted",
         }
+        assert updated.to_table(filter="score = 0.1").column("value").to_pylist() == [
+            "tenth-new"
+        ]
+        assert updated.to_table(filter="score = 1e-05").column("value").to_pylist() == [
+            "tiny-new"
+        ]
 
+    def test_merge_into_bool_keys(self, temp_dir: str) -> None:
+        """Boolean keys update the matched row and insert the missing one."""
         bool_path = Path(temp_dir) / "bool_key"
         lance.write_dataset(
             pa.table({"flag": [True], "value": ["yes"]}), str(bool_path)
