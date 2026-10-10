@@ -183,6 +183,11 @@ def test_sql_literal_renders_common_scalars() -> None:
         _sql_literal(Decimal("12.000"), pa.decimal128(5, 3)) == "DECIMAL(5,3) '12.000'"
     )
     assert _sql_literal(b"abc", pa.binary()) == "X'616263'"
+    assert _sql_literal(1.5, pa.float64()) == "1.5"
+    with pytest.raises(ValueError, match="finite"):
+        _sql_literal(float("nan"), pa.float64())
+    with pytest.raises(ValueError, match="finite"):
+        _sql_literal(float("inf"), pa.float32())
 
 
 def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
@@ -226,8 +231,10 @@ def test_fragment_match_ids_stay_packed_and_release() -> None:
     for start in range(0, n, batch):
         values = pa.array(np.arange(start, start + batch, dtype=np.int64))
         matches.append(values, values)
+    assert len(matches.row_ids) == n // batch
+    assert all(isinstance(array, pa.Array) for array in matches.row_ids)
     matches.release_row_ids_after_duplicate_check("fragment 1")
-    _current, peak = tracemalloc.get_traced_memory()
+    _current, packed_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     offsets = matches.take_offsets_after_duplicate_check("fragment 1 offsets")
 
@@ -236,9 +243,18 @@ def test_fragment_match_ids_stay_packed_and_release() -> None:
     assert len(offsets) == n
     assert offsets[0].as_py() == 0
     assert offsets[n - 1].as_py() == n - 1
-    # A Python list plus a duplicate-detecting set of 200k ints is tens of
-    # MiB. Packed Arrow buffers are not allocated on the Python heap.
-    assert peak < 8 * 1024 * 1024
+
+    tracemalloc.start()
+    python_ids: list[int] = []
+    for start in range(0, n, batch):
+        python_ids.extend(range(start, start + batch))
+    python_ids_set = set(python_ids)
+    _current, python_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert len(python_ids_set) == n
+    # Compare with a list-plus-set of the same integers in this process.
+    # An absolute byte cap tracks unrelated allocator noise.
+    assert packed_peak < python_peak
 
     duplicate = _FragmentMatchIds()
     duplicate.append(
@@ -309,6 +325,57 @@ def test_fragment_match_ids_drop_parent_bucket_buffers() -> None:
     assert stored_root is not None
     assert stored_root.size == 8
     assert stored_root.address != root.address
+
+
+def test_nonfinite_float_keys_are_rejected() -> None:
+    from lance_ray.merge_into import _align_chunk
+
+    nan_rows = pa.table(
+        {
+            "score": pa.array([1.0, float("nan")], type=pa.float64()),
+            "value": pa.array(["a", "b"]),
+        }
+    )
+    with pytest.raises(ValueError, match="finite"):
+        _align_chunk(nan_rows, nan_rows.schema, "score")
+    inf_rows = pa.table(
+        {
+            "score": pa.array([float("-inf")], type=pa.float64()),
+            "value": pa.array(["a"]),
+        }
+    )
+    with pytest.raises(ValueError, match="finite"):
+        _align_chunk(inf_rows, inf_rows.schema, "score")
+
+
+def test_empty_temporal_batches_keep_one_schema() -> None:
+    from lance_ray.merge_into import _add_temporal_sort_key, _dedupe_source_batch
+
+    empty = pa.table({"ts": pa.array([], type=pa.timestamp("ns"))})
+    sort_column = "__merge_into_sort_key"
+    keyed = _add_temporal_sort_key(empty, on="ts", sort_column=sort_column)
+    assert keyed.num_rows == 0
+    assert sort_column in keyed.column_names
+    assert keyed.column(sort_column).type == pa.int64()
+    dropped = _dedupe_source_batch(keyed, on="ts", sort_column=sort_column)
+    assert sort_column not in dropped.column_names
+    assert dropped.schema == empty.schema
+
+
+def test_scalar_index_field_names_use_backticks() -> None:
+    from lance_ray.merge_into import _has_scalar_index_on
+
+    class _Index:
+        field_names = ["`user.id`", "id"]
+
+    class _Dataset:
+        def describe_indices(self) -> list[_Index]:
+            return [_Index()]
+
+    dataset = cast(lance.LanceDataset, _Dataset())
+    assert _has_scalar_index_on(dataset, "user.id")
+    assert _has_scalar_index_on(dataset, "id")
+    assert not _has_scalar_index_on(dataset, "user")
 
 
 def test_schema_field_ids_include_nested_leaves() -> None:
@@ -550,6 +617,89 @@ class TestMergeInto:
         assert values[17] == "b"
         assert values[27] == "c"
         assert values[200] == "d"
+        assert updated.to_table(filter="id = 7").column("value").to_pylist() == ["a"]
+        assert updated.to_table(filter="id = 200").column("value").to_pylist() == ["d"]
+        assert updated.to_table(filter="id = 0").column("value").to_pylist() == [
+            "orig_0"
+        ]
+
+    def test_merge_into_float_and_bool_keys(self, temp_dir: str) -> None:
+        """Finite float keys and boolean keys update and insert."""
+        float_path = Path(temp_dir) / "float_key"
+        lance.write_dataset(
+            pa.table({"score": [1.5, 2.5], "value": ["a", "b"]}), str(float_path)
+        )
+        updated = lr.merge_into(
+            pa.table({"score": [2.5, 3.5], "value": ["updated", "new"]}),
+            str(float_path),
+            on="score",
+            num_workers=1,
+        )
+        by_score = {
+            row["score"]: row["value"] for row in updated.to_table().to_pylist()
+        }
+        assert by_score == {1.5: "a", 2.5: "updated", 3.5: "new"}
+
+        bool_path = Path(temp_dir) / "bool_key"
+        lance.write_dataset(
+            pa.table({"flag": [True], "value": ["yes"]}), str(bool_path)
+        )
+        updated = lr.merge_into(
+            pa.table({"flag": [True, False], "value": ["still", "no"]}),
+            str(bool_path),
+            on="flag",
+            num_workers=1,
+        )
+        by_flag = {row["flag"]: row["value"] for row in updated.to_table().to_pylist()}
+        assert by_flag == {True: "still", False: "no"}
+
+    def test_second_merge_sees_existing_deletion_vector(self, temp_dir: str) -> None:
+        """A later merge updates rows already masked by a deletion vector."""
+        path = Path(temp_dir) / "second_merge"
+        create_dataset_with_fragments(path, make_fragments(2, 5))
+        mid = lr.merge_into(
+            pa.table({"id": [1, 20], "value": ["v1", "ins"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+        assert any(
+            fragment.deletion_file is not None for fragment in mid.get_fragments()
+        )
+        final = lr.merge_into(
+            pa.table({"id": [1, 20, 21], "value": ["v2", "ins2", "newer"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+        values = id_to_value(final)
+        assert values[1] == "v2"
+        assert values[20] == "ins2"
+        assert values[21] == "newer"
+        assert values[0] == "orig_0"
+        assert final.count_rows() == 12
+
+    def test_merge_keeps_dataset_storage_version(self, temp_dir: str) -> None:
+        """New fragments stay on the target table's data storage version."""
+        path = Path(temp_dir) / "storage_version"
+        lance.write_dataset(
+            pa.table({"id": [1, 2], "value": ["a", "b"]}),
+            str(path),
+            data_storage_version="2.1",
+        )
+        updated = lr.merge_into(
+            pa.table({"id": [2, 3], "value": ["updated", "new"]}),
+            str(path),
+            on="id",
+            num_workers=1,
+        )
+        assert updated.data_storage_version == "2.1"
+        versions = {
+            (data_file.file_major_version, data_file.file_minor_version)
+            for fragment in updated.get_fragments()
+            for data_file in fragment.data_files()
+        }
+        assert versions == {(2, 1)}
 
     def test_merge_into_with_stable_row_ids(self, temp_dir: str) -> None:
         """Updated keys keep their logical _rowid; inserts get a new id."""

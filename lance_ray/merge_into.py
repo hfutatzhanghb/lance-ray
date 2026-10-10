@@ -29,8 +29,9 @@ to fit on the driver:
    chunks (plan tasks) run; it does not multiply the apply fan-out. The
    driver only receives small metadata; bucket bytes move from plan node to
    apply node directly through the Ray object store. Apply tasks pull those
-   buckets one at a time, so a larger ``num_partitions`` also bounds each
-   apply task's resident source data.
+   buckets one at a time, so a larger ``num_partitions`` bounds the
+   deserialized source held inside one worker. The object store still keeps
+   the deduplicated source and every bucket until commit.
 2. APPLY (distributed): each apply task owns a disjoint set of target
    fragments (guaranteed by the ownership function). Updates are
    merge-on-read: for every owned fragment the task writes a *deletion file*
@@ -47,7 +48,11 @@ to fit on the driver:
    operation is already visible in the latest manifest, the driver returns
    the latest dataset instead of failing (so a caller retry cannot
    double-insert). A concurrent rewrite, remove, or merge-on-read update of
-   a fragment this merge modifies still fails.
+   a fragment this merge modifies still fails. Every writer, including a
+   plain append, must stay serialized with this merge: an append of a key
+   this merge also inserts is invisible at ``read_version`` and both commits
+   succeed. Data files and deletion files written before a failed apply or
+   commit stay in storage until ``cleanup_old_versions``.
 
 Example:
     >>> import lance_ray as lr
@@ -62,6 +67,7 @@ import collections
 import datetime
 import json
 import logging
+import math
 import pickle
 import time
 import zlib
@@ -311,7 +317,12 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
     if pa.types.is_integer(arrow_type):
         return str(int(value))
     if pa.types.is_floating(arrow_type):
-        return repr(float(value))
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(
+                "Floating join keys must be finite; NaN and infinity are rejected."
+            )
+        return repr(number)
     if _is_string_type(arrow_type):
         return _sql_string_literal(value)
     if pa.types.is_date(arrow_type):
@@ -355,7 +366,29 @@ def _align_chunk(chunk: pa.Table, target_schema: pa.Schema, on: str) -> pa.Table
     key_column = chunk.column(on)
     if key_column.null_count:
         raise ValueError(f"Source contains null values in join key column {on!r}")
+    _raise_if_nonfinite_float_keys(key_column, on)
     return chunk
+
+
+def _raise_if_nonfinite_float_keys(
+    column: pa.Array[Any] | pa.ChunkedArray[Any], on: str
+) -> None:
+    """Reject NaN and infinity before dedupe and SQL rendering.
+
+    ``pc.not_equal(NaN, NaN)`` is true, and ``float('nan')`` does not collapse
+    inside a Python ``set``, so neither the adjacent-duplicate drop nor the
+    plan-task duplicate check would merge those rows. ``repr`` of NaN or
+    infinity is also not a Lance SQL numeric literal.
+    """
+    arrow_type = _unwrap_dictionary_type(column.type)
+    if not pa.types.is_floating(arrow_type):
+        return
+    values = column.cast(arrow_type) if pa.types.is_dictionary(column.type) else column
+    if pc.any(pc.is_nan(values)).as_py() or pc.any(pc.is_inf(values)).as_py():
+        raise ValueError(
+            f"Join key column {on!r} contains NaN or infinity. "
+            "Floating join keys must be finite."
+        )
 
 
 def _raise_on_duplicate_keys(keys: list[Any], on: str, context: str) -> None:
@@ -581,11 +614,11 @@ def _add_temporal_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table
     """Give Ray's Python sampling an exact integer key for temporal sorting."""
     if not isinstance(batch, pa.Table):
         raise TypeError("Merge source batches must be Arrow tables")
-    if batch.num_rows == 0:
-        return batch
     keys = batch.column(on)
     arrow_type = _unwrap_dictionary_type(keys.type)
     integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
+    if batch.num_rows == 0:
+        return batch.append_column(sort_column, pa.array([], type=integer_type))
     return batch.append_column(sort_column, keys.cast(arrow_type).cast(integer_type))
 
 
@@ -593,11 +626,15 @@ def _dedupe_source_batch(batch: Any, *, on: str, sort_column: str | None) -> pa.
     """Remove a temporary sorting column before source rows reach planning."""
     if not isinstance(batch, pa.Table):
         raise TypeError("Merge source batches must be Arrow tables")
-    if batch.num_rows == 0:
-        return batch
-    if sort_column is not None:
-        batch = batch.drop_columns([sort_column])
-    return _drop_adjacent_duplicate_keys(batch, on)
+    table: pa.Table = batch
+    if sort_column is not None and sort_column in table.column_names:
+        dropped = table.drop_columns([sort_column])
+        if not isinstance(dropped, pa.Table):
+            raise TypeError("Merge source batches must be Arrow tables")
+        table = dropped
+    if table.num_rows == 0:
+        return table
+    return _drop_adjacent_duplicate_keys(table, on)
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +677,6 @@ def _plan_task(
             "matched": 0,
             "touched_fragments": [],
             "bucket_owners": [],
-            "bucket_rows": [0] * n_apply,
             "elapsed_s": time.perf_counter() - t0,
         }
     else:
@@ -706,7 +742,7 @@ def _plan_task(
                 )
 
         rowid_column, offset_column = _helper_column_names(target_schema)
-        owners, buckets, bucket_rows = _pack_plan_buckets(
+        owners, buckets, _bucket_rows = _pack_plan_buckets(
             n_apply,
             source_chunk,
             updates_by_owner,
@@ -723,7 +759,6 @@ def _plan_task(
             "matched": num_matched,
             "touched_fragments": sorted(touched_fragments),
             "bucket_owners": owners,
-            "bucket_rows": bucket_rows,
             "elapsed_s": time.perf_counter() - t0,
         }
 
@@ -813,7 +848,6 @@ def _apply_task(
     task_id: int,
     uri: str,
     read_version: int,
-    on: str,
     storage_options: Optional[dict[str, Any]],
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
@@ -825,10 +859,11 @@ def _apply_task(
     ``bucket_refs`` are this task's bucket ObjectRefs from every plan task.
     They are nested inside a list on purpose so Ray does not resolve them on
     the driver -- this task fetches them here, i.e. the bytes move from the
-    plan node to this node directly.     Buckets are materialized one at a time. Match offsets are stored as packed
-    Arrow integers and released after that fragment's deletion file is written.
-    Stable row ids are not kept across buckets; each bucket supplies its own
-    ids when its replacement rows are written.
+    plan node to this node directly. Buckets are materialized one at a time.
+    Match offsets are stored as packed Arrow integers and released after that
+    fragment's deletion file is written. Stable row ids are not kept across
+    buckets; each bucket supplies its own ids when its replacement rows are
+    written.
 
     For each owned fragment the task writes
     a new *deletion file* marking the matched rows dead
@@ -859,6 +894,11 @@ def _apply_task(
     rowid_column, offset_column = _helper_column_names(dataset.schema)
     fragment_by_id = {f.fragment_id: f for f in dataset.get_fragments()}
     uses_stable_row_ids = bool(getattr(dataset, "has_stable_row_ids", False))
+    storage_version = getattr(dataset, "data_storage_version", None)
+    if storage_version:
+        # The writer documents ``None`` as format 2.0. Pass the open dataset's
+        # version so a new fragment stays on the table's format.
+        write_kwargs["data_storage_version"] = storage_version
 
     # Pass 1 keeps packed integer identities and releases each Arrow payload
     # before the next bucket is fetched. Row-id buffers are dropped after the
@@ -1155,6 +1195,19 @@ def _write_append_fragments(
     *,
     enable_stable_row_ids: bool = False,
 ) -> list[Any]:
+    """Append one in-memory table and return fragment metadata.
+
+    ``lance_ray.fragment.write_fragment`` consumes a block stream and returns
+    ``(fragment, schema)`` pairs for ``write_lance``. This path already holds
+    one table, then attaches ``row_id_meta`` on the returned metadata, so it
+    calls ``lance.fragment.write_fragments`` directly. Namespace credential
+    kwargs and the dataset ``data_storage_version`` arrive in ``write_kwargs``.
+    ``initial_bases`` is create-only. Base placement (``target_bases`` /
+    ``target_all_bases``) and file-size limits stay at the writer defaults:
+    ``merge_into`` has no write-option arguments, and the dataset object does
+    not expose a base list to copy. The fragment writer's ``call_with_retry``
+    defaults to a single attempt, which is the same as calling the writer once.
+    """
     if table.num_rows == 0:
         return []
     fragments = lance.fragment.write_fragments(
@@ -1191,13 +1244,24 @@ def _schema_field_ids(schema: Any) -> list[int]:
     return field_ids
 
 
+def _index_field_name(name: str) -> str:
+    """Undo Lance's minimal backtick quoting of an index field path.
+
+    ``format_field_path_minimal`` quotes with backticks, and only when the
+    path contains ``.`` or a backtick. A dotted key such as ``user.id`` is
+    therefore `` `user.id` ``, not a double-quoted identifier.
+    """
+    if len(name) >= 2 and name.startswith("`") and name.endswith("`"):
+        return name[1:-1].replace("``", "`")
+    return name
+
+
 def _has_scalar_index_on(dataset: lance.LanceDataset, column: str) -> bool:
     try:
         if hasattr(dataset, "describe_indices"):
             for index in dataset.describe_indices():
                 names = getattr(index, "field_names", None) or []
-                # field_names may render identifiers quoted (e.g. '"id"').
-                if any(name.strip('"') == column for name in names):
+                if any(_index_field_name(name) == column for name in names):
                     return True
             return False
         for legacy_index in dataset.list_indices():
@@ -1311,18 +1375,19 @@ def merge_into(
     single atomic version. Scans filter through the deletion vectors until
     the next compaction folds them away.
 
-    Concurrency: conflict detection is fragment-level. Concurrent appends
-    that land during the merge_into are rebased inside
-    ``LanceDataset.commit``; a concurrent commit that rewrote, removed, or
-    updated-in-place (new deletion file / fragment metadata) any fragment
-    this merge_into touches fails -- re-run against the latest version.
+    Concurrency: conflict detection is fragment-level, and this function does
+    not retry the plan. Serialize every writer to the table for the whole
+    call, including ordinary appends. A concurrent append is rebased inside
+    ``LanceDataset.commit`` and both commits succeed. If that append inserts
+    a key this merge also inserts, the plan ran at ``read_version`` and never
+    saw it, so the table keeps both rows. A concurrent commit that rewrote,
+    removed, or updated-in-place (new deletion file / fragment metadata) any
+    fragment this merge touches fails -- re-run against the latest version.
     If ``commit`` raises after this operation is already visible in the
-    latest manifest (lost success ack), the call still returns that
-    dataset so a job-level retry cannot double-insert. Two concurrent
-    merge_into calls inserting
-    the same *new* key are physically disjoint and would both succeed,
-    duplicating the key; serialize merge_into against the same table to
-    avoid this.
+    latest manifest (lost success ack), the call still returns that dataset
+    so a job-level retry cannot double-insert. Data files and deletion files
+    written before a failed apply task or a commit conflict remain in storage
+    until ``LanceDataset.cleanup_old_versions()``.
 
     Args:
         ds: The rows to merge into the target table, as a
@@ -1336,12 +1401,12 @@ def merge_into(
             (``namespace_impl`` + ``table_id``) must be provided.
         on: The join key column name. Supported types are boolean, integer,
             floating, string, date, timestamp, time, decimal, and binary
-            (dictionary-encoded scalars unwrap to the value type). Nested
-            types are rejected on the driver before any Ray task starts. A
-            scalar index on this column is strongly recommended for large
-            targets (the plan phase falls back to filtered scans without
-            one). Every target row whose key matches a source row is
-            updated (join-all).
+            (dictionary-encoded scalars unwrap to the value type). Floating
+            keys must be finite; NaN and infinity are rejected. Nested types
+            are rejected on the driver before any Ray task starts. A scalar
+            index on this column is strongly recommended for large targets
+            (the plan phase falls back to filtered scans without one). Every
+            target row whose key matches a source row is updated (join-all).
         table_id: The table identifier as a list of strings. Must be provided
             together with ``namespace_impl``.
         namespace_impl: The namespace implementation type (e.g. ``"rest"``,
@@ -1357,10 +1422,14 @@ def merge_into(
             ``num_workers``). Raise it to shrink each plan chunk without
             creating more apply tasks (e.g. ``num_partitions=32`` with
             ``num_workers=8``). Apply tasks stream those chunks one at a time,
-            so the same setting bounds each apply task's resident source rows
-            and preserved row ids by the largest chunk. Match offsets are
-            packed integers and are released when that fragment's deletion
-            file is written. A hot fragment stays on one owner.
+            so the same setting bounds the deserialized source rows and
+            preserved row ids inside one worker by the largest chunk. It does
+            not shrink the Ray object store: the deduplicated source and every
+            bucket stay there until commit, and join-all can copy one source
+            row into several buckets. Match offsets are packed integers and
+            are released when that fragment's deletion file is written. A hot
+            fragment stays on one owner. New fragments use the target
+            dataset's ``data_storage_version``.
         ray_remote_args: Options for the Ray tasks (e.g. ``num_cpus``,
             ``resources``).
 
@@ -1475,7 +1544,6 @@ def merge_into(
             owner,
             uri,
             read_version,
-            on,
             storage_options,
             namespace_impl,
             namespace_properties,
