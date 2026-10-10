@@ -202,6 +202,11 @@ def _sql_string_literal(value: Any) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _sql_identifier(name: str) -> str:
+    """Quote a Lance SQL identifier, doubling any embedded backticks."""
+    return "`" + name.replace("`", "``") + "`"
+
+
 def _sql_date_literal(value: Any) -> str:
     if isinstance(value, datetime.datetime):
         value = value.date()
@@ -274,7 +279,17 @@ def _sql_decimal_literal(value: Any, arrow_type: pa.DataType) -> str:
             raise ValueError(
                 f"Decimal join key {value} does not fit DECIMAL({precision},{scale})"
             ) from exc
-    return f"DECIMAL({precision},{scale}) '{format(quantized, 'f')}'"
+    rendered = format(quantized, "f")
+    # Lance 12 parses a SQL DECIMAL literal as Decimal128, so a Decimal256
+    # value with more than 38 digits cannot use that syntax. arrow_cast keeps
+    # the full precision.
+    if pa.types.is_decimal256(arrow_type):
+        type_name = f"Decimal256({precision}, {scale})"
+        return (
+            f"arrow_cast({_sql_string_literal(rendered)}, "
+            f"{_sql_string_literal(type_name)})"
+        )
+    return f"DECIMAL({precision},{scale}) '{rendered}'"
 
 
 def _sql_binary_literal(value: Any) -> str:
@@ -322,7 +337,12 @@ def _sql_literal(value: Any, arrow_type: pa.DataType | None = None) -> str:
             raise ValueError(
                 "Floating join keys must be finite; NaN and infinity are rejected."
             )
-        return repr(number)
+        rendered = repr(number)
+        # Lance parses an untyped SQL float as Float64 and cannot cast that
+        # literal onto a Float16 column.
+        if pa.types.is_float16(arrow_type):
+            return f"arrow_cast({rendered}, 'Float16')"
+        return rendered
     if _is_string_type(arrow_type):
         return _sql_string_literal(value)
     if pa.types.is_date(arrow_type):
@@ -610,8 +630,28 @@ def _drop_adjacent_duplicate_keys(batch: pa.Table, on: str) -> pa.Table:
     return batch.filter(mask)
 
 
-def _add_temporal_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table:
-    """Give Ray's Python sampling an exact integer key for temporal sorting."""
+def _sort_helper_type(arrow_type: pa.DataType) -> pa.DataType | None:
+    """Return a sortable projection of ``arrow_type``, or None.
+
+    Dictionary columns and ``float16`` have no Arrow sort or inequality
+    kernel. Temporal values are projected to integer ticks so Ray's boundary
+    sample does not round them through Python. The original column stays in
+    the batch; only the helper is sorted and compared.
+    """
+    value_type = _unwrap_dictionary_type(arrow_type)
+    if pa.types.is_float16(value_type):
+        return pa.float32()
+    if pa.types.is_time32(value_type):
+        return pa.int32()
+    if pa.types.is_time(value_type) or pa.types.is_timestamp(value_type):
+        return pa.int64()
+    if pa.types.is_dictionary(arrow_type):
+        return value_type
+    return None
+
+
+def _add_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table:
+    """Append a comparable helper column and keep the original key type."""
     if not isinstance(batch, pa.Table):
         raise TypeError("Merge source batches must be Arrow tables")
     # Ray's sort can emit a zero-column table for an empty range. That block
@@ -619,11 +659,16 @@ def _add_temporal_sort_key(batch: Any, *, on: str, sort_column: str) -> pa.Table
     if batch.num_rows == 0 and on not in batch.column_names:
         return batch
     keys = batch.column(on)
-    arrow_type = _unwrap_dictionary_type(keys.type)
-    integer_type = pa.int32() if pa.types.is_time32(arrow_type) else pa.int64()
+    helper_type = _sort_helper_type(keys.type)
+    if helper_type is None:
+        return batch
     if batch.num_rows == 0:
-        return batch.append_column(sort_column, pa.array([], type=integer_type))
-    return batch.append_column(sort_column, keys.cast(arrow_type).cast(integer_type))
+        return batch.append_column(sort_column, pa.array([], type=helper_type))
+    value_type = _unwrap_dictionary_type(keys.type)
+    projected = keys.cast(value_type) if pa.types.is_dictionary(keys.type) else keys
+    if not projected.type.equals(helper_type):
+        projected = projected.cast(helper_type)
+    return batch.append_column(sort_column, projected)
 
 
 def _dedupe_source_batch(batch: Any, *, on: str, sort_column: str | None) -> pa.Table:
@@ -631,14 +676,26 @@ def _dedupe_source_batch(batch: Any, *, on: str, sort_column: str | None) -> pa.
     if not isinstance(batch, pa.Table):
         raise TypeError("Merge source batches must be Arrow tables")
     table: pa.Table = batch
-    if sort_column is not None and sort_column in table.column_names:
-        dropped = table.drop_columns([sort_column])
+    helper_name = (
+        sort_column
+        if sort_column is not None and sort_column in table.column_names
+        else None
+    )
+    compare_on = helper_name if helper_name is not None else on
+    if table.num_rows == 0:
+        if helper_name is None:
+            return table
+        dropped = table.drop_columns([helper_name])
         if not isinstance(dropped, pa.Table):
             raise TypeError("Merge source batches must be Arrow tables")
-        table = dropped
-    if table.num_rows == 0:
-        return table
-    return _drop_adjacent_duplicate_keys(table, on)
+        return dropped
+    deduped = _drop_adjacent_duplicate_keys(table, compare_on)
+    if helper_name is None:
+        return deduped
+    dropped = deduped.drop_columns([helper_name])
+    if not isinstance(dropped, pa.Table):
+        raise TypeError("Merge source batches must be Arrow tables")
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -707,10 +764,12 @@ def _plan_task(
         for batch in _chunked(keys, _LOOKUP_BATCH_SIZE):
             in_list = ", ".join(_sql_literal(key, key_type) for key in batch)
             # Backticks are Lance's identifier quoting (double quotes would be
-            # parsed as a string literal by the filter planner).
+            # parsed as a string literal by the filter planner). An embedded
+            # backtick in the column name is doubled so the identifier does
+            # not end early.
             hit_table = dataset.to_table(
                 columns=[on],
-                filter=f"`{on}` IN ({in_list})",
+                filter=f"{_sql_identifier(on)} IN ({in_list})",
                 with_row_address=True,
                 with_row_id=True,
             )
@@ -1330,16 +1389,17 @@ def _source_to_chunk_refs(
         )
     )
     sort_column = None
-    key_type = _unwrap_dictionary_type(target_schema.field(on).type)
-    if pa.types.is_time(key_type) or pa.types.is_timestamp(key_type):
-        # Ray samples sort boundaries with Arrow's to_pylist(). Python time
-        # cannot represent time64[ns] values containing nonzero nanoseconds.
-        # Integer ticks preserve exact ordering and keep duplicate keys in
-        # one partition; the original Arrow column remains untouched.
+    key_type = target_schema.field(on).type
+    if _sort_helper_type(key_type) is not None:
+        # Ray samples sort boundaries with Arrow's to_pylist(), and Arrow has
+        # no sort or inequality kernel for dictionary or float16. A decoded
+        # or widened helper is what gets sorted and deduplicated. Temporal
+        # helpers are integer ticks so nanoseconds are not rounded through
+        # Python. The original key column is kept.
         sort_column = _unused_column_name(_SORT_COLUMN, set(target_schema.names))
         dataset = _require_ray_dataset(
             dataset.map_batches(
-                partial(_add_temporal_sort_key, on=on, sort_column=sort_column),
+                partial(_add_sort_key, on=on, sort_column=sort_column),
                 batch_size=None,
                 batch_format="pyarrow",
             )
@@ -1407,8 +1467,9 @@ def merge_into(
     If ``commit`` raises after this operation is already visible in the
     latest manifest (lost success ack), the call still returns that dataset
     so a job-level retry cannot double-insert. Data files and deletion files
-    written before a failed apply task or a commit conflict remain in storage
-    until ``LanceDataset.cleanup_old_versions()``.
+    written before a failed apply task or a commit conflict remain in storage.
+    ``LanceDataset.cleanup_old_versions()`` reclaims them, but the default
+    keeps unverified failed-transaction files until they are 7 days old.
 
     Args:
         ds: The rows to merge into the target table, as a

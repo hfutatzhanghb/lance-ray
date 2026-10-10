@@ -199,7 +199,16 @@ def test_sql_decimal_literal_accepts_full_decimal128_precision() -> None:
         "DECIMAL(38,2) '111111111111111111111111111111111111.25'"
     )
     wide = Decimal("9" * 40)
-    assert _sql_literal(wide, pa.decimal256(40, 0)) == f"DECIMAL(40,0) '{wide}'"
+    assert _sql_literal(wide, pa.decimal256(40, 0)) == (
+        f"arrow_cast('{wide}', 'Decimal256(40, 0)')"
+    )
+
+
+def test_sql_identifier_doubles_embedded_backticks() -> None:
+    from lance_ray.merge_into import _sql_identifier
+
+    assert _sql_identifier("id") == "`id`"
+    assert _sql_identifier("key`name") == "`key``name`"
 
 
 def test_delete_offsets_are_real_numbers() -> None:
@@ -349,11 +358,11 @@ def test_nonfinite_float_keys_are_rejected() -> None:
 
 
 def test_empty_temporal_batches_keep_one_schema() -> None:
-    from lance_ray.merge_into import _add_temporal_sort_key, _dedupe_source_batch
+    from lance_ray.merge_into import _add_sort_key, _dedupe_source_batch
 
     empty = pa.table({"ts": pa.array([], type=pa.timestamp("ns"))})
     sort_column = "__merge_into_sort_key"
-    keyed = _add_temporal_sort_key(empty, on="ts", sort_column=sort_column)
+    keyed = _add_sort_key(empty, on="ts", sort_column=sort_column)
     assert keyed.num_rows == 0
     assert sort_column in keyed.column_names
     assert keyed.column(sort_column).type == pa.int64()
@@ -361,7 +370,7 @@ def test_empty_temporal_batches_keep_one_schema() -> None:
     assert sort_column not in dropped.column_names
     assert dropped.schema == empty.schema
     zero_column = empty.select([])
-    untouched = _add_temporal_sort_key(zero_column, on="ts", sort_column=sort_column)
+    untouched = _add_sort_key(zero_column, on="ts", sort_column=sort_column)
     assert untouched.num_rows == 0
     assert untouched.column_names == []
 
@@ -666,6 +675,118 @@ class TestMergeInto:
         assert updated.to_table(filter="score = 1e-05").column("value").to_pylist() == [
             "tiny-new"
         ]
+
+    def test_dictionary_and_float16_keys_round_trip(self, temp_dir: str) -> None:
+        """Dictionary and float16 keys sort through a helper and keep their type."""
+        dict_path = str(Path(temp_dir) / "dict_key")
+        dict_type = pa.dictionary(pa.int32(), pa.string())
+        lance.write_dataset(
+            pa.table(
+                {
+                    "label": pa.array(["keep", "old"], type=dict_type),
+                    "value": ["a", "b"],
+                }
+            ),
+            dict_path,
+        )
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "label": pa.array(["old", "old", "new"], type=dict_type),
+                    "value": ["first", "second", "inserted"],
+                }
+            ),
+            dict_path,
+            on="label",
+            num_workers=1,
+        )
+        dict_rows = {
+            row["label"]: row["value"] for row in updated.to_table().to_pylist()
+        }
+        assert dict_rows["keep"] == "a"
+        assert dict_rows["old"] in {"first", "second"}
+        assert dict_rows["new"] == "inserted"
+        assert len(dict_rows) == 3
+        assert pa.types.is_dictionary(updated.schema.field("label").type)
+
+        float_path = str(Path(temp_dir) / "float16_key")
+        lance.write_dataset(
+            pa.table(
+                {
+                    "score": pa.array([1, 2], type=pa.float16()),
+                    "value": ["a", "old"],
+                }
+            ),
+            float_path,
+        )
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "score": pa.array([2, 2, 3], type=pa.float16()),
+                    "value": ["first", "second", "inserted"],
+                }
+            ),
+            float_path,
+            on="score",
+            num_workers=1,
+        )
+        scores = {row["score"]: row["value"] for row in updated.to_table().to_pylist()}
+        assert scores[1.0] == "a"
+        assert scores[2.0] in {"first", "second"}
+        assert scores[3.0] == "inserted"
+        assert len(scores) == 3
+        assert updated.schema.field("score").type == pa.float16()
+
+    def test_decimal256_join_key_round_trips(self, temp_dir: str) -> None:
+        """A 40-digit decimal256 key matches through arrow_cast, not DECIMAL()."""
+        path = str(Path(temp_dir) / "decimal256")
+        decimal_type = pa.decimal256(40, 0)
+        amount = Decimal("9" * 40)
+        lance.write_dataset(
+            pa.table(
+                {
+                    "amount": pa.array([amount], type=decimal_type),
+                    "value": ["old"],
+                }
+            ),
+            path,
+        )
+        updated = lr.merge_into(
+            pa.table(
+                {
+                    "amount": pa.array([amount], type=decimal_type),
+                    "value": ["new"],
+                }
+            ),
+            path,
+            on="amount",
+            num_workers=1,
+        )
+        table = updated.to_table()
+        assert table.num_rows == 1
+        assert table.column("value").to_pylist() == ["new"]
+        assert table.column("amount").to_pylist() == [amount]
+
+    def test_backtick_in_join_column_name_is_escaped(self, temp_dir: str) -> None:
+        """A legal column name containing a backtick must not end the SQL identifier."""
+        from lance_ray.merge_into import _sql_identifier
+
+        name = "key`name"
+        assert _sql_identifier(name) == "`key``name`"
+        path = str(Path(temp_dir) / "backtick_key")
+        lance.write_dataset(
+            pa.table({name: pa.array([1], type=pa.int64()), "value": ["old"]}),
+            path,
+        )
+        dataset = lance.dataset(path)
+        try:
+            matched = dataset.to_table(
+                columns=["value"], filter=f"{_sql_identifier(name)} = 1"
+            )
+        except Exception as exc:
+            assert "Expected close delimiter" not in str(exc)
+        else:
+            assert matched.column("value").to_pylist() == ["old"]
 
     def test_merge_into_bool_keys(self, temp_dir: str) -> None:
         """Boolean keys update the matched row and insert the missing one."""
