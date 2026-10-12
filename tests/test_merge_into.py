@@ -2103,6 +2103,28 @@ class TestMergeIntoCommitAck:
 
 
 class TestMergeIntoValidation:
+    @pytest.mark.parametrize("backpressure", [1, 2, -1, None])
+    def test_rejects_generator_backpressure_before_target_resolution(
+        self, backpressure: int | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from importlib import import_module
+
+        module = import_module("lance_ray.merge_into")
+
+        def unexpected_resolution(*args: Any, **kwargs: Any) -> NoReturn:
+            pytest.fail("Target resolution must not run for unsupported Ray options")
+
+        monkeypatch.setattr(module, "resolve_namespace_table", unexpected_resolution)
+        remote_args = {"_generator_backpressure_num_objects": backpressure}
+        with pytest.raises(ValueError, match="_generator_backpressure_num_objects"):
+            lr.merge_into(
+                pa.table({"id": [1]}),
+                "/tmp/x.lance",
+                on="id",
+                ray_remote_args=remote_args,
+            )
+        assert remote_args == {"_generator_backpressure_num_objects": backpressure}
+
     def test_requires_uri_or_namespace(self) -> None:
         with pytest.raises(ValueError, match="Must provide either"):
             lr.merge_into(pa.table({"id": [1]}), on="id")

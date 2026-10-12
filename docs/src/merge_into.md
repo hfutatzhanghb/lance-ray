@@ -41,7 +41,7 @@ Returns the updated `lance.LanceDataset` at the committed version. When the sour
 - `storage_options`: Optional storage configuration dictionary
 - `num_workers`: Concurrent Ray tasks per phase **and** the number of apply-side fragment owners (default: 4). Ownership is `crc32(fragment_id) % num_workers`. Lower it to reduce concurrent IO and shuffle fan-out.
 - `num_partitions`: Number of source chunks for the plan phase only (default: `num_workers`). Raise this to shrink each plan chunk without creating more apply workers. Apply tasks stream those chunks one at a time, so the same setting bounds the deserialized source an apply worker holds to the largest chunk. It does not shrink cluster object-store use. After dedupe, `materialize()` and `to_arrow_refs()` keep the full deduplicated source in the object store. The driver holds every bucket reference until commit, and each apply task holds its own references for the whole task. Peak object-store use is about that deduplicated source plus every bucket. Join-all can place one source row in several buckets, so the total can exceed the source. Dropping a fetched payload frees only that worker's deserialized copy. A hot fragment stays on one owner; its rows are written chunk by chunk.
-- `ray_remote_args`: Optional kwargs for Ray remote tasks (e.g., `num_cpus`)
+- `ray_remote_args`: Optional kwargs for Ray remote tasks (e.g., `num_cpus`). The `_generator_backpressure_num_objects` option is rejected whenever present, regardless of its value. The plan scheduler waits for generators to finish before consuming their outputs, so enabling generator backpressure can deadlock it.
 
 ## Best practices
 

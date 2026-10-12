@@ -1705,7 +1705,9 @@ def merge_into(
             fragment stays on one owner. New fragments use the target
             dataset's ``data_storage_version``.
         ray_remote_args: Options for the Ray tasks (e.g. ``num_cpus``,
-            ``resources``).
+            ``resources``). ``_generator_backpressure_num_objects`` is rejected:
+            the plan scheduler waits for generators to finish before consuming
+            their outputs, so generator backpressure can deadlock it.
 
     Returns:
         The updated :class:`lance.LanceDataset` at the committed version.
@@ -1731,6 +1733,13 @@ def merge_into(
         raise ValueError("num_partitions must be >= 1")
     num_partitions = num_partitions or num_workers
     ray_remote_args = ray_remote_args or {}
+    if "_generator_backpressure_num_objects" in ray_remote_args:
+        raise ValueError(
+            "merge_into does not support ray_remote_args option "
+            "'_generator_backpressure_num_objects': the plan scheduler waits "
+            "for generators to finish before consuming their outputs, so "
+            "generator backpressure can deadlock it. Remove this option."
+        )
 
     validate_uri_or_namespace(uri, namespace_impl, table_id)
     uri, storage_options = resolve_namespace_table(
