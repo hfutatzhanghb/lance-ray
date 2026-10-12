@@ -95,14 +95,16 @@ def test_memory_plan_looks_up_integer_ids_from_fragment_metadata(
     dataset = _Dataset({1: 100, 2: 100})
     original = _Task([_FragmentMetadata(1), _FragmentMetadata(2)])
     monkeypatch.setattr(
-        compaction.Compaction, "plan", lambda dataset, options: _Plan([original])
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
     )
 
     tasks, metrics = compaction._create_memory_aware_compaction_plan(
         cast(Any, dataset), _options(), 10_000
     )
 
-    assert tasks == [original]
+    assert len(tasks) == 1
+    assert cast(Any, tasks[0]) is original
     assert dataset.requested_ids
     assert all(isinstance(fragment_id, int) for fragment_id in dataset.requested_ids)
     assert set(dataset.requested_ids) == {1, 2}
@@ -116,7 +118,8 @@ def test_memory_plan_splits_fragment_metadata_without_passing_it_to_get_fragment
     original = _Task([_FragmentMetadata(1), _FragmentMetadata(2)])
     rebuilt: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        compaction.Compaction, "plan", lambda dataset, options: _Plan([original])
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
     )
 
     def from_json(payload: str) -> Any:
@@ -125,7 +128,7 @@ def test_memory_plan_splits_fragment_metadata_without_passing_it_to_get_fragment
         rebuilt.append(decoded)
         return decoded
 
-    monkeypatch.setattr(compaction.CompactionTask, "from_json", from_json)
+    monkeypatch.setattr("lance_ray.compaction.CompactionTask.from_json", from_json)
 
     tasks, metrics = compaction._create_memory_aware_compaction_plan(
         cast(Any, dataset),
@@ -145,13 +148,15 @@ def test_memory_plan_accepts_integer_fragment_ids(monkeypatch: Any) -> None:
     dataset = _Dataset({4: 100})
     original = _Task([4])
     monkeypatch.setattr(
-        compaction.Compaction, "plan", lambda dataset, options: _Plan([original])
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
     )
 
     tasks, metrics = compaction._create_memory_aware_compaction_plan(
         cast(Any, dataset), _options(), 10_000
     )
 
-    assert tasks == [original]
+    assert len(tasks) == 1
+    assert cast(Any, tasks[0]) is original
     assert 4 in dataset.requested_ids
     assert metrics["tasks_split"] == 0

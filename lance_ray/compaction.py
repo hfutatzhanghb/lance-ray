@@ -146,6 +146,24 @@ def _estimate_fragment_memory(
     }
 
 
+def _compaction_task_json(task: CompactionTask) -> str:
+    """Serialize a task.
+
+    PyLance implements ``CompactionTask.json``, but the published stubs omit it.
+    """
+    payload = cast(Any, task).json()
+    if not isinstance(payload, str):
+        raise TypeError("CompactionTask.json() must return str")
+    return payload
+
+
+def _compaction_task_from_json(payload: str) -> CompactionTask:
+    """Load a task serialized by :func:`_compaction_task_json`."""
+    # The method exists at runtime; pylance 12 stubs do not declare it.
+    task = cast(Any, CompactionTask).from_json(payload)
+    return cast(CompactionTask, task)
+
+
 def _subset_compaction_task(
     task: CompactionTask, fragments: list[Any]
 ) -> CompactionTask:
@@ -155,7 +173,7 @@ def _subset_compaction_task(
     already contains the serialized ``Fragment`` records, so a split task is the
     original JSON with ``task.fragments`` filtered by id.
     """
-    payload = json.loads(task.json())
+    payload = json.loads(_compaction_task_json(task))
     if not isinstance(payload, dict):
         raise TypeError("CompactionTask JSON must be an object")
     task_payload = payload.get("task")
@@ -178,7 +196,7 @@ def _subset_compaction_task(
             raise ValueError(f"fragment {frag_id} is not part of the compaction task")
         selected.append(record)
     task_payload["fragments"] = selected
-    return CompactionTask.from_json(json.dumps(payload))
+    return _compaction_task_from_json(json.dumps(payload))
 
 
 def _create_memory_aware_compaction_plan(
