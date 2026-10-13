@@ -462,10 +462,9 @@ def compact_files(
     committed as a single compaction operation.
 
     Memory Management:
-        The function automatically analyzes fragment metadata to estimate memory
-        requirements and can split large compaction tasks into smaller chunks to
-        prevent OOM errors. Use `max_memory_per_task_bytes` to control the maximum
-        memory footprint per task.
+        Pass ``max_memory_per_task_bytes`` to estimate each task from fragment
+        file sizes and split tasks that would exceed that budget before they
+        are sent to Ray. Omitting it keeps Lance's normal compaction plan.
 
     Args:
         uri: The URI of the Lance dataset to compact. Either uri OR
@@ -481,11 +480,11 @@ def compact_files(
         namespace_properties: Properties for connecting to the namespace.
             Used together with namespace_impl and table_id.
         ray_remote_args: Options for Ray tasks (e.g., num_cpus, resources).
-        max_memory_per_task_bytes: Maximum memory (in bytes) to use per compaction
-            task. If None, defaults to 2GB. This parameter helps prevent OOM by
-            splitting large tasks into smaller, memory-safe chunks. The actual
-            memory usage is estimated based on fragment file sizes (with a 2x
-            multiplier for Arrow materialization overhead).
+        max_memory_per_task_bytes: Maximum estimated memory (in bytes) for one
+            compaction task. When omitted, planning stays on ``Compaction.plan``.
+            When set, oversized tasks are split before execution. Estimates use
+            known fragment file sizes with a 2x multiplier for Arrow
+            materialization. Unknown file sizes are not treated as zero.
 
             **Important**: If this value is smaller than the memory requirement of
             individual fragments, the system will still split tasks to the finest
@@ -631,6 +630,7 @@ def compact_database(
     num_workers: int = 4,
     storage_options: Optional[dict[str, str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
+    max_memory_per_task_bytes: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """
     Compact all tables under a given database (namespace) using distributed Ray workers.
@@ -649,6 +649,10 @@ def compact_database(
         num_workers: Number of Ray workers per table (default: 4).
         storage_options: Storage options for the datasets.
         ray_remote_args: Options for Ray tasks (e.g. num_cpus, resources).
+        max_memory_per_task_bytes: Maximum estimated memory (in bytes) for one
+            compaction task on every table. Passed through to
+            :func:`compact_files`. When omitted, each table keeps Lance's
+            normal compaction plan.
 
     Returns:
         A list of dicts, one per table, with keys:
@@ -721,6 +725,7 @@ def compact_database(
                 namespace_impl=namespace_impl,
                 namespace_properties=namespace_properties,
                 ray_remote_args=ray_remote_args,
+                max_memory_per_task_bytes=max_memory_per_task_bytes,
             )
             results.append({"table_id": table_id, "metrics": metrics})
         except Exception as e:

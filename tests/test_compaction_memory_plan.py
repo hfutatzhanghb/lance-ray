@@ -265,6 +265,39 @@ def test_memory_plan_unknown_file_size_is_not_treated_as_zero(
     assert any("unknown" in record.message.lower() for record in caplog.records)
 
 
+def test_compact_database_forwards_memory_limit(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class _Namespace:
+        def list_tables(self, request: Any) -> SimpleNamespace:
+            assert request.id == ["db"]
+            return SimpleNamespace(tables=["t1", "t2"], page_token=None)
+
+    monkeypatch.setattr(
+        "lance_ray.compaction.get_or_create_namespace",
+        lambda namespace_impl, namespace_properties: _Namespace(),
+    )
+
+    def fake_compact_files(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return "metrics"
+
+    monkeypatch.setattr("lance_ray.compaction.compact_files", fake_compact_files)
+
+    results = compaction.compact_database(
+        database=["db"],
+        namespace_impl="dir",
+        max_memory_per_task_bytes=1024,
+    )
+
+    assert [call["table_id"] for call in calls] == [["db", "t1"], ["db", "t2"]]
+    assert all(call["max_memory_per_task_bytes"] == 1024 for call in calls)
+    assert results == [
+        {"table_id": ["db", "t1"], "metrics": "metrics"},
+        {"table_id": ["db", "t2"], "metrics": "metrics"},
+    ]
+
+
 def test_estimate_fragment_memory_stores_integer_ids() -> None:
     dataset = _Dataset({8: 50, 9: 50})
     estimate = compaction._estimate_fragment_memory(cast(Any, dataset), [8, 9])
