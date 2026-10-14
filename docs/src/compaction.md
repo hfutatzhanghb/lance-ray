@@ -23,7 +23,7 @@ compact_files(
 
 Compact files in a single Lance table (dataset) using distributed Ray workers.
 
-When `max_memory_per_task_bytes` is omitted, Lance's normal compaction plan is executed as-is. When it is set, each task is estimated from fragment file sizes (2x the known physical size, to allow for Arrow materialization). Tasks above that budget are split before they are sent to Ray workers.
+When `max_memory_per_task_bytes` is omitted, Lance's normal compaction plan is executed as-is. When it is set, each task is estimated from base data files and overlay files (2x the known physical size, to allow for Arrow materialization). `data_files()` does not include overlays, so those sizes are read from fragment metadata. Tasks above that budget are split before they are sent to Ray workers. A missing size on a base file or an overlay keeps the fragment out of any task that only looks under budget.
 
 `CompactionTask.fragments` contains fragment metadata, while fragment lookup needs integer ids. The planner extracts those ids before estimating memory. A split task is rebuilt from the original task JSON, so `read_version`, compaction options, and the full fragment records stay intact. A fragment with unknown `file_size_bytes` is placed in its own task instead of being treated as free. A single fragment larger than the budget is still scheduled alone, and the planner warns that splitting cannot keep it under the limit.
 

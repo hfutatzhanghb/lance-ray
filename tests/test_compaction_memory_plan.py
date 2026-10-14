@@ -24,10 +24,14 @@ class _StoredFragment:
         file_size_bytes: int | None,
         *,
         missing_size: bool = False,
+        overlay_size_bytes: int | None = None,
+        missing_overlay_size: bool = False,
     ) -> None:
         self.fragment_id = fragment_id
         self._file_size_bytes = file_size_bytes
         self._missing_size = missing_size
+        self._overlay_size_bytes = overlay_size_bytes
+        self._missing_overlay_size = missing_overlay_size
 
     def count_rows(self) -> int:
         return 10
@@ -37,17 +41,43 @@ class _StoredFragment:
             return [SimpleNamespace(file_size_bytes=None)]
         return [SimpleNamespace(file_size_bytes=self._file_size_bytes)]
 
+    @property
+    def metadata(self) -> SimpleNamespace:
+        overlays: list[SimpleNamespace] = []
+        if self._missing_overlay_size or self._overlay_size_bytes is not None:
+            overlays.append(
+                SimpleNamespace(
+                    data_file=SimpleNamespace(
+                        file_size_bytes=(
+                            None
+                            if self._missing_overlay_size
+                            else self._overlay_size_bytes
+                        )
+                    )
+                )
+            )
+        return SimpleNamespace(overlays=overlays)
+
 
 class _Dataset:
     def __init__(
-        self, sizes: dict[int, int | None], *, missing: set[int] | None = None
+        self,
+        sizes: dict[int, int | None],
+        *,
+        missing: set[int] | None = None,
+        overlay_sizes: dict[int, int] | None = None,
+        missing_overlay: set[int] | None = None,
     ) -> None:
         missing = missing or set()
+        overlay_sizes = overlay_sizes or {}
+        missing_overlay = missing_overlay or set()
         self.fragments = [
             _StoredFragment(
                 fragment_id,
                 size,
                 missing_size=fragment_id in missing,
+                overlay_size_bytes=overlay_sizes.get(fragment_id),
+                missing_overlay_size=fragment_id in missing_overlay,
             )
             for fragment_id, size in sizes.items()
         ]
@@ -296,6 +326,148 @@ def test_compact_database_forwards_memory_limit(monkeypatch: Any) -> None:
         {"table_id": ["db", "t1"], "metrics": "metrics"},
         {"table_id": ["db", "t2"], "metrics": "metrics"},
     ]
+
+
+def test_estimate_includes_overlay_file_size() -> None:
+    # Base file is 200 bytes. data_files() hides the 2000-byte overlay.
+    # The 2x estimate must be (200 + 2000) * 2 = 4400, not 400.
+    dataset = _Dataset({1: 200}, overlay_sizes={1: 2000})
+    estimate = compaction._estimate_fragment_memory(cast(Any, dataset), [1])
+
+    assert estimate["fragment_details"][0]["file_size_bytes"] == 2200
+    assert estimate["estimated_memory_bytes"] == 4400
+    assert estimate["all_sizes_known"] is True
+
+
+def test_overlay_bytes_keep_task_from_looking_under_budget(
+    monkeypatch: Any,
+) -> None:
+    dataset = _Dataset({1: 200}, overlay_sizes={1: 2000})
+    original = _Task([_FragmentMetadata(1)])
+    monkeypatch.setattr(
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
+    )
+    monkeypatch.setattr(
+        "lance_ray.compaction.CompactionTask.from_json",
+        lambda payload: json.loads(payload),
+    )
+
+    tasks, metrics = compaction._create_memory_aware_compaction_plan(
+        cast(Any, dataset),
+        _options(),
+        1000,
+    )
+
+    assert metrics["tasks_split"] == 1
+    assert len(tasks) == 1
+    assert cast(Any, tasks[0]) is not original
+
+
+def test_unknown_overlay_size_is_not_treated_as_zero(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The base file fits in the budget. The overlay size is unknown, so the
+    # fragment must still be split out instead of staying in an under-budget task.
+    dataset = _Dataset({1: 100, 2: 100}, missing_overlay={1})
+    original = _Task([_FragmentMetadata(1), _FragmentMetadata(2)])
+    monkeypatch.setattr(
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
+    )
+    monkeypatch.setattr(
+        "lance_ray.compaction.CompactionTask.from_json",
+        lambda payload: json.loads(payload),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="lance_ray.compaction"):
+        tasks, metrics = compaction._create_memory_aware_compaction_plan(
+            cast(Any, dataset),
+            _options(),
+            10_000,
+        )
+
+    assert metrics["tasks_split"] == 1
+    assert len(tasks) == 2
+    assert any("unknown" in record.message.lower() for record in caplog.records)
+
+
+def test_split_parses_task_json_once(monkeypatch: Any) -> None:
+    fragment_count = 8
+    dataset = _Dataset({fragment_id: 1_000 for fragment_id in range(fragment_count)})
+    fragments = [
+        _FragmentMetadata(fragment_id) for fragment_id in range(fragment_count)
+    ]
+
+    class _CountingTask(_Task):
+        def __init__(self, task_fragments: list[Any]) -> None:
+            super().__init__(task_fragments)
+            self.json_calls = 0
+
+        def json(self) -> str:
+            self.json_calls += 1
+            return super().json()
+
+    original = _CountingTask(fragments)
+    index_calls = 0
+    real_index = compaction._index_compaction_task
+
+    def counting_index(task: Any) -> tuple[dict[str, Any], dict[int, Any]]:
+        nonlocal index_calls
+        index_calls += 1
+        return real_index(task)
+
+    monkeypatch.setattr(compaction, "_index_compaction_task", counting_index)
+    monkeypatch.setattr(
+        "lance_ray.compaction.Compaction.plan",
+        lambda dataset, options: _Plan([original]),
+    )
+    monkeypatch.setattr(
+        "lance_ray.compaction.CompactionTask.from_json",
+        lambda payload: json.loads(payload),
+    )
+
+    tasks, metrics = compaction._create_memory_aware_compaction_plan(
+        cast(Any, dataset),
+        _options(),
+        1_500,
+    )
+
+    assert metrics["tasks_split"] == 1
+    assert len(tasks) == fragment_count
+    assert original.json_calls == 1
+    assert index_calls == 1
+
+
+def test_subset_keeps_fragment_order_and_rejects_duplicates(
+    monkeypatch: Any,
+) -> None:
+    payload: dict[str, Any] = {
+        "read_version": 7,
+        "task": {
+            "fragments": [
+                {"id": 3, "files": [{"path": "c.lance"}]},
+                {"id": 1, "files": [{"path": "a.lance"}]},
+                {"id": 2, "files": [{"path": "b.lance"}]},
+            ]
+        },
+    }
+    by_id = {int(record["id"]): record for record in payload["task"]["fragments"]}
+    monkeypatch.setattr(
+        "lance_ray.compaction.CompactionTask.from_json",
+        lambda serialized: json.loads(serialized),
+    )
+
+    subset = compaction._subset_indexed_compaction_task(
+        payload,
+        by_id,
+        [3, 1, 2],
+    )
+    decoded = cast(dict[str, Any], subset)
+    assert [fragment["id"] for fragment in decoded["task"]["fragments"]] == [3, 1, 2]
+
+    with pytest.raises(ValueError, match="duplicate fragment 1"):
+        compaction._subset_indexed_compaction_task(payload, by_id, [1, 2, 1])
 
 
 def test_estimate_fragment_memory_stores_integer_ids() -> None:

@@ -120,8 +120,9 @@ def _estimate_fragment_memory(
 
     Returns a dict with total rows/file size, an estimated memory footprint, and
     per-fragment details. Each detail stores an integer ``fragment_id`` and a
-    ``size_known`` flag. Missing ``file_size_bytes`` is never treated as a safe
-    zero-cost contribution to packing decisions.
+    ``size_known`` flag. Base files and overlay files both count. A missing
+    ``file_size_bytes`` on either is never treated as a safe zero-cost
+    contribution to packing decisions.
     """
     if any(
         not isinstance(frag_id, int) or isinstance(frag_id, bool)
@@ -148,16 +149,14 @@ def _estimate_fragment_memory(
 
         frag_file_size = 0
         size_known = True
-        for data_file in fragment.data_files():
-            file_size = getattr(data_file, "file_size_bytes", None)
+        for data_file in _compaction_data_files(fragment):
+            if data_file is None:
+                size_known = False
+                continue
+            file_size = _read_file_size_bytes(frag_id, data_file)
             if file_size is None:
                 size_known = False
                 continue
-            if not isinstance(file_size, int) or isinstance(file_size, bool):
-                raise TypeError(
-                    f"Fragment {frag_id} file_size_bytes must be int or None, "
-                    f"got {type(file_size).__name__}"
-                )
             frag_file_size += file_size
 
         if size_known:
@@ -166,8 +165,8 @@ def _estimate_fragment_memory(
             total_file_size_bytes += frag_file_size
         else:
             logger.warning(
-                "Fragment %s is missing file_size_bytes; memory cost is unknown "
-                "and will not be treated as zero",
+                "Fragment %s is missing file_size_bytes on a base or overlay "
+                "file; memory cost is unknown and will not be treated as zero",
                 frag_id,
             )
 
@@ -193,6 +192,43 @@ def _estimate_fragment_memory(
     }
 
 
+def _read_file_size_bytes(frag_id: int, data_file: Any) -> int | None:
+    """Return a file size, or None when the size is absent."""
+    file_size = getattr(data_file, "file_size_bytes", None)
+    if file_size is None:
+        return None
+    if isinstance(file_size, bool) or not isinstance(file_size, int):
+        raise TypeError(
+            f"Fragment {frag_id} file_size_bytes must be int or None, "
+            f"got {type(file_size).__name__}"
+        )
+    return file_size
+
+
+def _compaction_data_files(fragment: Any) -> list[Any]:
+    """Return base data files plus overlay data files compaction will read.
+
+    ``LanceFragment.data_files`` exposes only ``metadata.files``. Overlay bytes
+    live on ``metadata.overlays`` and are read during compaction too. A missing
+    overlay data file is returned as None so the caller treats its size as
+    unknown instead of zero.
+    """
+    files: list[Any] = list(fragment.data_files())
+    metadata = getattr(fragment, "metadata", None)
+    if callable(metadata):
+        metadata = metadata()
+    if metadata is None:
+        return files
+
+    overlays = getattr(metadata, "overlays", None)
+    if not overlays:
+        return files
+
+    for overlay in overlays:
+        files.append(getattr(overlay, "data_file", None))
+    return files
+
+
 def _compaction_task_json(task: CompactionTask) -> str:
     """Serialize a task.
 
@@ -210,18 +246,10 @@ def _compaction_task_from_json(payload: str) -> CompactionTask:
     return cast(CompactionTask, task)
 
 
-def _subset_compaction_task(
-    task: CompactionTask, fragments: list[Any]
-) -> CompactionTask:
-    """Return ``task`` limited to ``fragments``, keeping read_version and options.
-
-    ``CompactionTask`` cannot be constructed from a bare fragment-id list. The
-    original task JSON already contains full fragment records; split tasks are
-    rebuilt by filtering those records and calling ``CompactionTask.from_json``.
-    """
-    if not fragments:
-        raise ValueError("Cannot create an empty compaction sub-task")
-
+def _index_compaction_task(
+    task: CompactionTask,
+) -> tuple[dict[str, Any], dict[int, Any]]:
+    """Parse ``task`` once and index its fragment records by id."""
     payload = json.loads(_compaction_task_json(task))
     if not isinstance(payload, dict):
         raise TypeError("CompactionTask JSON must be an object")
@@ -239,9 +267,24 @@ def _subset_compaction_task(
                 "CompactionTask JSON fragment records must include an integer id"
             )
         by_id[int(record["id"])] = record
+    return payload, by_id
+
+
+def _subset_indexed_compaction_task(
+    payload: dict[str, Any],
+    by_id: dict[int, Any],
+    fragments: list[Any],
+) -> CompactionTask:
+    """Rebuild one sub-task from an index produced by :func:`_index_compaction_task`."""
+    if not fragments:
+        raise ValueError("Cannot create an empty compaction sub-task")
+
+    task_payload = payload.get("task")
+    if not isinstance(task_payload, dict):
+        raise TypeError("CompactionTask JSON is missing task")
 
     selected: list[Any] = []
-    selected_ids: list[int] = []
+    selected_ids: set[int] = set()
     for fragment in fragments:
         frag_id = _fragment_id(fragment)
         record = by_id.get(frag_id)
@@ -250,10 +293,26 @@ def _subset_compaction_task(
         if frag_id in selected_ids:
             raise ValueError(f"duplicate fragment {frag_id} in compaction sub-task")
         selected.append(record)
-        selected_ids.append(frag_id)
+        selected_ids.add(frag_id)
 
-    task_payload["fragments"] = selected
-    return _compaction_task_from_json(json.dumps(payload))
+    subset_task = dict(task_payload)
+    subset_task["fragments"] = selected
+    subset_payload = dict(payload)
+    subset_payload["task"] = subset_task
+    return _compaction_task_from_json(json.dumps(subset_payload))
+
+
+def _subset_compaction_task(
+    task: CompactionTask, fragments: list[Any]
+) -> CompactionTask:
+    """Return ``task`` limited to ``fragments``, keeping read_version and options.
+
+    ``CompactionTask`` cannot be constructed from a bare fragment-id list. The
+    original task JSON already contains full fragment records; split tasks are
+    rebuilt by filtering those records and calling ``CompactionTask.from_json``.
+    """
+    payload, by_id = _index_compaction_task(task)
+    return _subset_indexed_compaction_task(payload, by_id, fragments)
 
 
 def _split_compaction_task(
@@ -282,6 +341,7 @@ def _split_compaction_task(
             max(known_sizes),
         )
 
+    payload, fragments_by_id = _index_compaction_task(task)
     sub_tasks: list[CompactionTask] = []
     split_ids: list[int] = []
     current_batch: list[Any] = []
@@ -294,7 +354,9 @@ def _split_compaction_task(
         batch_ids = [_fragment_id(fragment) for fragment in current_batch]
         if not batch_ids:
             raise RuntimeError("split produced an empty compaction sub-task")
-        sub_tasks.append(_subset_compaction_task(task, current_batch))
+        sub_tasks.append(
+            _subset_indexed_compaction_task(payload, fragments_by_id, current_batch)
+        )
         split_ids.extend(batch_ids)
         current_batch = []
         current_batch_size = 0
@@ -315,7 +377,9 @@ def _split_compaction_task(
                 frag_id,
             )
             flush_batch()
-            sub_tasks.append(_subset_compaction_task(task, [fragment]))
+            sub_tasks.append(
+                _subset_indexed_compaction_task(payload, fragments_by_id, [fragment])
+            )
             split_ids.append(frag_id)
             continue
 
